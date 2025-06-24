@@ -1,8 +1,8 @@
+use candle::backend::BackendStorage;
 #[cfg(feature = "cuda")]
 use candle::CudaStorage;
 #[cfg(feature = "metal")]
 use candle::MetalStorage;
-use candle::backend::BackendStorage;
 use candle::{CpuStorage, DType, Layout, Result, Shape, Storage, Tensor};
 use candle_core as candle;
 use half::{bf16, f16};
@@ -28,8 +28,8 @@ impl PagedAttention {
         q: &CudaStorage,
         q_l: &Layout,
     ) -> Result<(CudaStorage, Shape)> {
-        use candle::cuda_backend::WrapErr;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::cuda_backend::WrapErr;
         let dtype = q.dtype();
         let internal_type = match dtype {
             DType::F16 => 0,
