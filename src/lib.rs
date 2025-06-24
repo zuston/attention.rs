@@ -123,7 +123,7 @@ impl PagedAttention {
                     Some(0),
                 )?
             } else {
-                candle_flash_attn::flash_attn_varlen(
+                candle_flash_attn::flash_attn_varlen_softcap(
                     &q,
                     &k,
                     &v,
