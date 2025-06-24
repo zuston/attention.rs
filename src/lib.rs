@@ -86,40 +86,27 @@ impl PagedAttention {
 
         #[cfg(feature = "flash-attn")]
         let att = if input_metadata.is_prefill {
-            let k = candle_transformers::utils::repeat_kv(
-                key.clone(),
-                attention_heads / key_value_heads,
-            )?
-            .contiguous()?;
-            let v = candle_transformers::utils::repeat_kv(
-                value.clone(),
-                attention_heads / key_value_heads,
-            )?
-            .contiguous()?;
+            let q = query
+                .transpose(1, 2)?
+                .reshape(((), attention_heads, head_size))?;
+            let k = key
+                .transpose(1, 2)?
+                .reshape(((), key_value_heads, head_size))?;
+            let v = value
+                .transpose(1, 2)?
+                .reshape(((), key_value_heads, head_size))?;
 
-            let q = query.transpose(1, 2)?;
-            let k = k.transpose(1, 2)?;
-            let v = v.transpose(1, 2)?;
-            let attn = if self.sliding_window.is_some() {
-                candle_flash_attn::flash_attn_windowed_softcap(
-                    &q,
-                    &k,
-                    &v,
-                    self.scale as f32,
-                    Some(softcapping.unwrap_or(0.0f64) as f32),
-                    self.sliding_window,
-                    Some(0),
-                )?
-            } else {
-                candle_flash_attn::flash_attn_softcap(
-                    &q,
-                    &k,
-                    &v,
-                    self.scale as f32,
-                    Some(softcapping.unwrap_or(0.0f64) as f32),
-                    true,
-                )?
-            };
+            let attn = candle_flash_attn::flash_attn_varlen(
+                &q,
+                &k,
+                &v,
+                input_metadata.cu_seqlens_q.as_ref().unwrap(),
+                input_metadata.cu_seqlens_k.as_ref().unwrap(),
+                input_metadata.max_seqlen_q,
+                input_metadata.max_seqlen_k,
+                self.scale as f32,
+                true,
+            )?;
             Some(attn)
         } else {
             None
@@ -144,7 +131,6 @@ impl PagedAttention {
                     Some(sc) => ((att / sc)?.tanh()? * sc)?,
                 };
 
-                // println!("attn {:?}", att.shape());
                 let att = if attention_mask.is_some() {
                     att.broadcast_add(attention_mask.as_ref().unwrap())?
                 } else {
