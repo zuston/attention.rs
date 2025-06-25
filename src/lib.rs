@@ -86,27 +86,15 @@ impl PagedAttention {
 
         #[cfg(feature = "flash-attn")]
         let att = if input_metadata.is_prefill {
-            let k = candle_transformers::utils::repeat_kv(
-                key.clone(),
-                attention_heads / key_value_heads,
-            )?
-            .contiguous()?;
-
-            let v = candle_transformers::utils::repeat_kv(
-                value.clone(),
-                attention_heads / key_value_heads,
-            )?
-            .contiguous()?;
-
             let q = query
                 .transpose(1, 2)?
                 .reshape(((), attention_heads, head_size))?;
-            let k = k
+            let k = key
                 .transpose(1, 2)?
-                .reshape(((), attention_heads, head_size))?;
-            let v = v
+                .reshape(((), key_value_heads, head_size))?;
+            let v = value
                 .transpose(1, 2)?
-                .reshape(((), attention_heads, head_size))?;
+                .reshape(((), key_value_heads, head_size))?;
 
             let attn = if self.sliding_window.is_some() {
                 candle_flash_attn::flash_attn_varlen_windowed_softcap(
@@ -136,7 +124,7 @@ impl PagedAttention {
                     true,
                 )?
             };
-            Some(attn)
+            Some(attn.transpose(1, 2)?)
         } else {
             None
         };
