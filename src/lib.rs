@@ -174,9 +174,9 @@ impl PagedAttention {
                         Tensor::cat(&vec![&value; attention_heads / key_value_heads], 2)?
                             .reshape((batch_size, attention_heads, seq_len, head_size))?
                     };
-                    Some(att.matmul(&value_repeat.contiguous()?)?.transpose(1, 2)?)
+                    Some(att.matmul(&value_repeat.contiguous()?)?)
                 } else {
-                    Some(att.matmul(value)?.transpose(1, 2)?)
+                    Some(att.matmul(value)?)
                 }
             } else {
                 None
