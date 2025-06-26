@@ -68,7 +68,7 @@ impl PagedAttention {
         query: &Tensor,
         key: &Tensor,
         value: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: Option<&Vec<Tensor>>,
         key_cache: Option<Tensor>,
         value_cache: Option<Tensor>,
         input_metadata: &InputMetadata,
@@ -130,8 +130,23 @@ impl PagedAttention {
         };
 
         #[cfg(not(feature = "flash-attn"))]
-        let att =
-            if input_metadata.is_prefill {
+        let att = if input_metadata.is_prefill {
+            assert!(attention_mask.is_some(), "attention mask missing");
+            let indices = &input_metadata
+                .cu_seqlens_q
+                .as_ref()
+                .unwrap()
+                .to_vec1::<u32>()?[1..];
+            let seqlens: Vec<_> = indices.iter().map(|x| x).collect();
+            let vec_mask = attention_mask.as_ref().unwrap();
+            let mut vec_attn = Vec::new();
+            let mut start = 0usize;
+            for (i, mask) in vec_mask.iter().enumerate() {
+                let seq_len = (*seqlens[i] as usize - start) as usize;
+                let query = query.narrow(2, start, seq_len)?.contiguous()?;
+                let key = key.narrow(2, start, seq_len)?.contiguous()?;
+                let value = value.narrow(2, start, seq_len)?.contiguous()?;
+                start += *seqlens[i] as usize;
                 let att = if key_value_heads != attention_heads {
                     let key_repeat = if key_value_heads == 1 {
                         key.broadcast_as((batch_size, attention_heads, seq_len, head_size))?
@@ -148,27 +163,27 @@ impl PagedAttention {
                     Some(sc) => ((att / sc)?.tanh()? * sc)?,
                 };
 
-                let att = if attention_mask.is_some() {
-                    att.broadcast_add(attention_mask.as_ref().unwrap())?
-                } else {
-                    att
-                };
+                let att = att.broadcast_add(&vec_mask[i])?;
+
                 let att = candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
                     .to_dtype(att.dtype())?;
-                if key_value_heads != attention_heads {
+                let att = if key_value_heads != attention_heads {
                     let value_repeat = if key_value_heads == 1 {
                         value.broadcast_as((batch_size, attention_heads, seq_len, head_size))?
                     } else {
                         Tensor::cat(&vec![&value; attention_heads / key_value_heads], 2)?
                             .reshape((batch_size, attention_heads, seq_len, head_size))?
                     };
-                    Some(att.matmul(&value_repeat.contiguous()?)?)
+                    att.matmul(&value_repeat.contiguous()?)?
                 } else {
-                    Some(att.matmul(value)?)
-                }
-            } else {
-                None
-            };
+                    att.matmul(&value)?
+                };
+                vec_attn.push(att);
+            }
+            Some(Tensor::cat(&vec_attn, 2)?.contiguous()?)
+        } else {
+            None
+        };
 
         // // paged-attn expects [batch_size, num_tokens, num_heads, head_size]
         let query = query
