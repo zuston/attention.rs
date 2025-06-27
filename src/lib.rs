@@ -1,5 +1,5 @@
 pub mod paged_attention;
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 use paged_attention::{paged_attention, reshape_and_cache};
 
 pub struct InputMetadata {
