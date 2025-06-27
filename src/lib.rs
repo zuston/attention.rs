@@ -165,8 +165,9 @@ impl PagedAttention {
 
                 let att = att.broadcast_add(&vec_mask[i])?;
 
-                let att = candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
-                    .to_dtype(att.dtype())?;
+                let att =
+                    candle_nn::ops::softmax_last_dim(&att.to_dtype(candle_core::DType::F32)?)?
+                        .to_dtype(att.dtype())?;
                 let att = if key_value_heads != attention_heads {
                     let value_repeat = if key_value_heads == 1 {
                         value.broadcast_as((batch_size, attention_heads, seq_len, head_size))?
