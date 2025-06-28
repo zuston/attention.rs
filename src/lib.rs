@@ -128,58 +128,84 @@ impl PagedAttention {
         } else {
             None
         };
+        fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
+            if n_rep == 1 {
+                Ok(x)
+            } else {
+                let (b_sz, n_kv_head, seq_len, head_dim) = x.dims4()?;
+                Tensor::cat(&vec![&x; n_rep], 2)?.reshape((
+                    b_sz,
+                    n_kv_head * n_rep,
+                    seq_len,
+                    head_dim,
+                ))
+            }
+        }
 
         #[cfg(not(feature = "flash-attn"))]
         let att = if input_metadata.is_prefill {
-            assert!(attention_mask.is_some(), "attention mask missing");
             let indices = &input_metadata
                 .cu_seqlens_q
                 .as_ref()
                 .unwrap()
                 .to_vec1::<u32>()?[1..];
             let seqlens: Vec<_> = indices.iter().map(|x| x).collect();
-            let vec_mask = attention_mask.as_ref().unwrap();
+
             let mut vec_attn = Vec::new();
             let mut start = 0usize;
-            for (i, mask) in vec_mask.iter().enumerate() {
-                let seq_len = (*seqlens[i] as usize - start) as usize;
-                let query = query.narrow(2, start, seq_len)?.contiguous()?;
-                let key = key.narrow(2, start, seq_len)?.contiguous()?;
-                let value = value.narrow(2, start, seq_len)?.contiguous()?;
-                start += *seqlens[i] as usize;
-                let att = if key_value_heads != attention_heads {
-                    let key_repeat = if key_value_heads == 1 {
-                        key.broadcast_as((batch_size, attention_heads, seq_len, head_size))?
-                    } else {
-                        Tensor::cat(&vec![&key; attention_heads / key_value_heads], 2)?
-                            .reshape((batch_size, attention_heads, seq_len, head_size))?
-                    };
-                    (query.matmul(&key_repeat.t()?.contiguous()?)? * f64::from(self.scale))?
+            //chunked attention for each sequence
+            for (i, seqlen) in seqlens.iter().enumerate() {
+                let seq_len = (**seqlen as usize - start) as usize;
+                let chunk_size = 1024;
+                let mut attn_chunks = vec![];
+
+                let query_seq = query.narrow(2, start, seq_len)?.contiguous()?;
+                let key_seq = key.narrow(2, start, seq_len)?.contiguous()?;
+                let value_seq = value.narrow(2, start, seq_len)?.contiguous()?;
+
+                let key_seq = if key_value_heads != attention_heads {
+                    repeat_kv(key_seq, attention_heads / key_value_heads)?
                 } else {
-                    (query.matmul(&key.t()?)? * f64::from(self.scale))?
-                };
-                let att = match softcapping {
-                    None => att,
-                    Some(sc) => ((att / sc)?.tanh()? * sc)?,
+                    key_seq
                 };
 
-                let att = att.broadcast_add(&vec_mask[i])?;
-
-                let att =
-                    candle_nn::ops::softmax_last_dim(&att.to_dtype(candle_core::DType::F32)?)?
-                        .to_dtype(att.dtype())?;
-                let att = if key_value_heads != attention_heads {
-                    let value_repeat = if key_value_heads == 1 {
-                        value.broadcast_as((batch_size, attention_heads, seq_len, head_size))?
-                    } else {
-                        Tensor::cat(&vec![&value; attention_heads / key_value_heads], 2)?
-                            .reshape((batch_size, attention_heads, seq_len, head_size))?
-                    };
-                    att.matmul(&value_repeat.contiguous()?)?
+                let value_seq = if key_value_heads != attention_heads {
+                    repeat_kv(value_seq, attention_heads / key_value_heads)?
                 } else {
-                    att.matmul(&value)?
+                    value_seq
                 };
+
+                let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
+
+                for c in 0..num_chunks {
+                    let offset = c * chunk_size;
+                    let len = chunk_size.min(seq_len - offset);
+                    //chunk at query is correct for the following
+                    let q_chunk = query_seq.narrow(2, offset, len)?.contiguous()?;
+                    let mut att = (q_chunk.matmul(&key_seq.t()?)? * f64::from(self.scale))?;
+
+                    if let Some(sc) = softcapping {
+                        att = ((att / sc)?.tanh()? * sc)?;
+                    }
+
+                    if let Some(mask) = &attention_mask {
+                        //mask needs to be chunked
+                        let q_chunk_mask = mask[i].narrow(2, offset, len)?; // shape: [1, 1, chunk_len, K_len]
+                        att = att.broadcast_add(&q_chunk_mask)?;
+                    }
+
+                    att =
+                        candle_nn::ops::softmax_last_dim(&att.to_dtype(candle_core::DType::F32)?)?
+                            .to_dtype(att.dtype())?;
+
+                    let att_chunk = att.matmul(&value_seq)?;
+                    attn_chunks.push(att_chunk);
+                }
+
+                let att = Tensor::cat(&attn_chunks, 2)?.contiguous()?;
                 vec_attn.push(att);
+
+                start += **seqlen as usize;
             }
             Some(Tensor::cat(&vec_attn, 2)?.contiguous()?)
         } else {
