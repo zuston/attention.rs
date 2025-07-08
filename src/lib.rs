@@ -205,7 +205,7 @@ impl PagedAttention {
                 let att = Tensor::cat(&attn_chunks, 2)?.contiguous()?;
                 vec_attn.push(att);
 
-                start += **seqlen as usize;
+                start = **seqlen as usize;
             }
             Some(Tensor::cat(&vec_attn, 2)?.contiguous()?)
         } else {
