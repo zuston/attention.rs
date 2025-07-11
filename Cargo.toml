@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5a7e317" }
-candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5a7e317" }
-candle-transformers = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5a7e317" }
-candle-flash-attn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5a7e317", optional = true }
+candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "1fb97f9" }
+candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "1fb97f9" }
+candle-transformers = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "1fb97f9" }
+candle-flash-attn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "1fb97f9", optional = true }
 serde = { version = "1.0.190", features = ["serde_derive"] }
 serde_json = "1.0.108"
 cudarc = {version = "0.13.9", features = ["f16", "cuda-version-from-build-system"], optional = true }
