@@ -541,6 +541,7 @@ struct ReshapeCache {
     key_cache: Tensor,
     value_cache: Tensor,
     slot_mapping: Tensor,
+    flash_attn: bool,
 }
 
 impl ReshapeCache {
@@ -601,7 +602,14 @@ impl ReshapeCache {
             )
         }
 
-        if kc_rank != 5 {
+        if kc_rank != 4 && self.flash_attn {
+            candle::bail!(
+                "flash-attention expects `key_cache` tensor to be of rank 4 \
+                    (key_cache: {kc_l:?})"
+            )
+        }
+
+        if kc_rank != 5 && !self.flash_attn {
             candle::bail!(
                 "paged-attention expects `key_cache` tensor to be of rank 5 \
                     (key_cache: {kc_l:?})"
@@ -634,22 +642,29 @@ impl ReshapeCache {
             candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
         }
 
-        let (num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
-        if num_heads_kc != num_heads || head_size_kc != head_size / x {
-            candle::bail!(
-                "shape mismatch value_cache {:?}, expected {:?}",
-                vc_l.shape(),
-                (num_blocks, num_heads, head_size / x, block_size, x)
-            )
-        }
+        let (block_size, x) = if self.flash_attn {
+            // [num_blocks, block_size, num_heads, head_size]
+            let (_, block_size, _, _) = kc_l.shape().dims4()?;
+            (block_size, 1)
+        } else {
+            let (num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
+            if num_heads_kc != num_heads || head_size_kc != head_size / x {
+                candle::bail!(
+                    "shape mismatch value_cache {:?}, expected {:?}",
+                    vc_l.shape(),
+                    (num_blocks, num_heads, head_size / x, block_size, x)
+                )
+            }
 
-        if (num_blocks, num_heads, head_size, block_size) != vc_l.shape().dims4()? {
-            candle::bail!(
-                "shape mismatch key_cache {:?} and value_cache {:?}",
-                kc_l.shape(),
-                vc_l.shape()
-            )
-        }
+            if (num_blocks, num_heads, head_size, block_size) != vc_l.shape().dims4()? {
+                candle::bail!(
+                    "shape mismatch key_cache {:?} and value_cache {:?}",
+                    kc_l.shape(),
+                    vc_l.shape()
+                )
+            }
+            (block_size, x)
+        };
 
         if (num_tokens) != s_l.shape().dims1()? {
             candle::bail!(
@@ -668,22 +683,47 @@ impl ReshapeCache {
         let vc_ptr = *vc.device_ptr() as *const core::ffi::c_void;
         let s_ptr = *s.device_ptr() as *const core::ffi::c_long;
         unsafe {
-            kernels::ffi::call_reshape_and_cache(
-                k_ptr,
-                v_ptr,
-                kc_ptr,
-                vc_ptr,
-                s_ptr,
-                num_tokens as c_int,
-                num_heads as c_int,
-                head_size as c_int,
-                block_size as c_int,
-                x as c_int,
-                key_stride,
-                value_stride,
-                internal_type,
-                *dev.cu_stream() as i64,
-            )
+            if self.flash_attn {
+                let block_stride = kc_l.stride()[0];
+                let page_stride = kc_l.stride()[1];
+                let head_stride = kc_l.stride()[2];
+
+                kernels::ffi::call_reshape_and_cache_flash(
+                    k_ptr,  // [num_tokens, num_heads, head_size]
+                    v_ptr,  // [num_tokens, num_heads, head_size]
+                    kc_ptr, // [num_blocks, block_size, num_heads, head_size]
+                    vc_ptr, // [num_blocks, block_size, num_heads, head_size]
+                    s_ptr,  // [num_tokens]
+                    num_tokens as c_int,
+                    num_heads as c_int,
+                    head_size as c_int,
+                    block_size as c_int,
+                    key_stride,
+                    value_stride,
+                    block_stride as c_int,
+                    page_stride as c_int,
+                    head_stride as c_int,
+                    internal_type,
+                    *dev.cu_stream() as i64,
+                );
+            } else {
+                kernels::ffi::call_reshape_and_cache(
+                    k_ptr,
+                    v_ptr,
+                    kc_ptr,
+                    vc_ptr,
+                    s_ptr,
+                    num_tokens as c_int,
+                    num_heads as c_int,
+                    head_size as c_int,
+                    block_size as c_int,
+                    x as c_int,
+                    key_stride,
+                    value_stride,
+                    internal_type,
+                    *dev.cu_stream() as i64,
+                );
+            }
         }
         Ok(())
     }
@@ -893,12 +933,14 @@ pub fn reshape_and_cache(
     key_cache: &Tensor,
     value_cache: &Tensor,
     slot_mapping: &Tensor,
+    flash_attn: bool,
 ) -> Result<()> {
     let op = ReshapeCache {
         value: value.to_owned(),
         key_cache: key_cache.to_owned(),
         value_cache: value_cache.to_owned(),
         slot_mapping: slot_mapping.to_owned(),
+        flash_attn,
     };
     key.inplace_op1(&op)
 }

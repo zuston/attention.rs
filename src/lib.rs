@@ -12,6 +12,7 @@ pub struct InputMetadata {
     pub max_seqlen_q: usize,
     pub max_seqlen_k: usize,
     pub max_context_len: usize,
+    pub use_flash_attn: Option<bool>,
 }
 
 #[allow(dead_code)]
@@ -53,39 +54,31 @@ impl PagedAttention {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[cfg(not(feature = "flash-attn"))]
+    fn repeat_kv(&self, x: Tensor, n_rep: usize) -> Result<Tensor> {
+        if n_rep == 1 {
+            Ok(x)
+        } else {
+            let (b_sz, n_kv_head, seq_len, head_dim) = x.dims4()?;
+            Tensor::cat(&vec![&x; n_rep], 2)?.reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
+        }
+    }
+
     #[allow(unused_variables)]
-    /// query: shape = [batch_size, seq_len, num_heads * head_size]
-    /// key: shape = [batch_size, seq_len, num_kv_heads * head_size]
-    /// value: shape = [batch_size, num_kv_heads * head_size]
-    /// key_cache: shape = [num_blocks, num_kv_heads, head_size/x,
-    ///     block_size, x]
-    /// value_cache: shape = [num_blocks, num_kv_heads, head_size,
-    ///     block_size]
-    /// input_metadata: metadata for paged attention.
-    pub fn forward(
+    pub fn forward_prefill(
         &self,
         query: &Tensor,
         key: &Tensor,
         value: &Tensor,
         attention_mask: Option<&Vec<Tensor>>,
-        key_cache: Option<Tensor>,
-        value_cache: Option<Tensor>,
         input_metadata: &InputMetadata,
         softcapping: Option<f64>,
     ) -> Result<Tensor> {
-        let dims = input_metadata.slot_mapping.dims();
-        let slot_mapping = if dims.len() > 1 {
-            input_metadata.slot_mapping.flatten_all()?
-        } else {
-            input_metadata.slot_mapping.clone()
-        };
-
-        let (batch_size, attention_heads, seq_len, head_size) = query.shape().dims4()?;
+        let (_, attention_heads, _, head_size) = query.shape().dims4()?;
         let (_, key_value_heads, _, _) = key.shape().dims4()?;
 
         #[cfg(feature = "flash-attn")]
-        let att = if input_metadata.is_prefill {
+        let att = {
             let q = query
                 .transpose(1, 2)?
                 .reshape(((), attention_heads, head_size))?;
@@ -124,26 +117,11 @@ impl PagedAttention {
                     true,
                 )?
             };
-            Some(attn.transpose(1, 2)?)
-        } else {
-            None
+            attn
         };
-        fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
-            if n_rep == 1 {
-                Ok(x)
-            } else {
-                let (b_sz, n_kv_head, seq_len, head_dim) = x.dims4()?;
-                Tensor::cat(&vec![&x; n_rep], 2)?.reshape((
-                    b_sz,
-                    n_kv_head * n_rep,
-                    seq_len,
-                    head_dim,
-                ))
-            }
-        }
 
         #[cfg(not(feature = "flash-attn"))]
-        let att = if input_metadata.is_prefill {
+        let att = {
             let indices = &input_metadata
                 .cu_seqlens_q
                 .as_ref()
@@ -164,13 +142,13 @@ impl PagedAttention {
                 let value_seq = value.narrow(2, start, seq_len)?.contiguous()?;
 
                 let key_seq = if key_value_heads != attention_heads {
-                    repeat_kv(key_seq, attention_heads / key_value_heads)?
+                    self.repeat_kv(key_seq, attention_heads / key_value_heads)?
                 } else {
                     key_seq
                 };
 
                 let value_seq = if key_value_heads != attention_heads {
-                    repeat_kv(value_seq, attention_heads / key_value_heads)?
+                    self.repeat_kv(value_seq, attention_heads / key_value_heads)?
                 } else {
                     value_seq
                 };
@@ -207,15 +185,56 @@ impl PagedAttention {
 
                 start = **seqlen as usize;
             }
-            Some(Tensor::cat(&vec_attn, 2)?.contiguous()?)
+            Tensor::cat(&vec_attn, 2)?.contiguous()?.transpose(1, 2)?
+        };
+
+        Ok(att)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(unused_variables)]
+    /// query: shape = [batch_size, seq_len, num_heads * head_size]
+    /// key: shape = [batch_size, seq_len, num_kv_heads * head_size]
+    /// value: shape = [batch_size, num_kv_heads * head_size]
+    /// key_cache: shape = [num_blocks, num_kv_heads, head_size/x,
+    ///     block_size, x]
+    /// value_cache: shape = [num_blocks, num_kv_heads, head_size,
+    ///     block_size]
+    /// input_metadata: metadata for paged attention.
+    pub fn forward(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        attention_mask: Option<&Vec<Tensor>>,
+        key_cache: Option<Tensor>,
+        value_cache: Option<Tensor>,
+        input_metadata: &InputMetadata,
+        softcapping: Option<f64>,
+    ) -> Result<Tensor> {
+        let dims = input_metadata.slot_mapping.dims();
+        let slot_mapping = if dims.len() > 1 {
+            input_metadata.slot_mapping.flatten_all()?
+        } else {
+            input_metadata.slot_mapping.clone()
+        };
+
+        let (batch_size, attention_heads, seq_len, head_size) = query.shape().dims4()?;
+        let (_, key_value_heads, _, _) = key.shape().dims4()?;
+
+        let att = if input_metadata.is_prefill {
+            Some(self.forward_prefill(
+                query,
+                key,
+                value,
+                attention_mask,
+                input_metadata,
+                softcapping,
+            )?)
         } else {
             None
         };
 
-        // // paged-attn expects [batch_size, num_tokens, num_heads, head_size]
-        let query = query
-            .transpose(1, 2)?
-            .reshape(((), attention_heads, head_size))?;
         let key = key
             .transpose(1, 2)?
             .reshape(((), key_value_heads, head_size))?;
@@ -225,8 +244,6 @@ impl PagedAttention {
 
         // key: Tensor,              // [num_tokens, num_heads, head_size]
         // value: Tensor,            // [num_tokens, num_heads, head_size]
-        // key_cache: &mut Tensor,   // [num_blocks, num_heads, head_size/x, block_size, x] 48,32,16,16,8
-        // value_cache: &mut Tensor, // [num_blocks, num_heads, head_size, block_size] 48,32,128,16
         // slot_mapping: Tensor,     // [num_tokens]
         if key_cache.as_ref().is_some_and(|_| value_cache.is_some()) {
             reshape_and_cache(
@@ -235,13 +252,44 @@ impl PagedAttention {
                 key_cache.as_ref().unwrap(),
                 value_cache.as_ref().unwrap(),
                 &slot_mapping,
+                input_metadata.use_flash_attn.unwrap_or(false),
             )?;
         }
 
         if let Some(att) = att {
             //prefill result
-            return Ok(att.transpose(1, 2)?);
+            return Ok(att);
         }
+
+        let block_tables = input_metadata.block_tables.as_ref().unwrap();
+        let context_lens = input_metadata.context_lens.as_ref().unwrap();
+        let query = query
+            .transpose(1, 2)?
+            .reshape(((), attention_heads, head_size))?;
+
+        #[cfg(feature = "flash-attn")]
+        if input_metadata.use_flash_attn.unwrap_or(false)
+            && key_cache.as_ref().is_some_and(|_| value_cache.is_some())
+        {
+            //decoding with falsh-attn
+            //key_cache, value_cache: [num_blocks, block_size, num_heads, head_size]
+            return candle_flash_attn::flash_attn_with_kvcache(
+                &query.unsqueeze(1)?, //(batch_size, seqlen_q, num_heads_q, head_size)
+                key_cache.as_ref().unwrap(),
+                value_cache.as_ref().unwrap(),
+                context_lens,
+                block_tables,
+                self.scale as f32,
+            );
+        }
+
+        //decoding with paged-attn
+        let max_context_len = if self.sliding_window.is_some() {
+            self.sliding_window.unwrap()
+        } else {
+            input_metadata.max_context_len
+        };
+
         //  Args:
         //  output: shape = [num_generation_tokens, num_heads, head_size]
         //
@@ -256,15 +304,6 @@ impl PagedAttention {
         //  input_metadata: metadata for paged attention.
         //
         //  alibi_slopes: shape = [num_heads]
-        let max_context_len = if self.sliding_window.is_some() {
-            self.sliding_window.unwrap()
-        } else {
-            input_metadata.max_context_len
-        };
-        let block_tables = input_metadata.block_tables.as_ref().unwrap();
-        let context_lens = input_metadata.context_lens.as_ref().unwrap();
-        // println!("slot_mapping {:?}, block_tables {:?} context_lens {:?}", slot_mapping, block_tables, context_lens);
-
         paged_attention(
             &query,
             key_cache.as_ref().unwrap(),
