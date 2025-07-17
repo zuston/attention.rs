@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "20bc32b" }
-candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "20bc32b" }
-candle-transformers = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "20bc32b" }
-candle-flash-attn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "20bc32b", optional = true }
+candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "81db266" }
+candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "81db266" }
+candle-transformers = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "81db266" }
+candle-flash-attn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "81db266", optional = true }
 serde = { version = "1.0.190", features = ["serde_derive"] }
 serde_json = "1.0.108"
 cudarc = {version = "0.13.9", features = ["f16", "cuda-version-from-build-system"], optional = true }
@@ -21,4 +21,5 @@ metal-kernels = {path = "./src/metal-kernels", version="0.1.0", optional = true}
 cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:kernels"]
 graph = ["cuda", "candle-core/graph"]
 flash-attn = ["dep:candle-flash-attn"]
+flash-decoding = ["dep:candle-flash-attn", "candle-flash-attn/flash-decoding"]
 metal = ["candle-core/metal", "candle-nn/metal", "dep:metal-kernels", "dep:metal"]

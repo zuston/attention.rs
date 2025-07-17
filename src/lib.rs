@@ -12,7 +12,6 @@ pub struct InputMetadata {
     pub max_seqlen_q: usize,
     pub max_seqlen_k: usize,
     pub max_context_len: usize,
-    pub use_flash_attn: Option<bool>,
 }
 
 #[allow(dead_code)]
@@ -252,7 +251,6 @@ impl PagedAttention {
                 key_cache.as_ref().unwrap(),
                 value_cache.as_ref().unwrap(),
                 &slot_mapping,
-                input_metadata.use_flash_attn.unwrap_or(false),
             )?;
         }
 
@@ -267,10 +265,8 @@ impl PagedAttention {
             .transpose(1, 2)?
             .reshape(((), attention_heads, head_size))?;
 
-        #[cfg(feature = "flash-attn")]
-        if input_metadata.use_flash_attn.unwrap_or(false)
-            && key_cache.as_ref().is_some_and(|_| value_cache.is_some())
-        {
+        #[cfg(feature = "flash-decoding")]
+        if key_cache.as_ref().is_some_and(|_| value_cache.is_some()) {
             //decoding with falsh-attn
             //key_cache, value_cache: [num_blocks, block_size, num_heads, head_size]
             return candle_flash_attn::flash_attn_with_kvcache(

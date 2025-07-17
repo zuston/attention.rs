@@ -541,7 +541,6 @@ struct ReshapeCache {
     key_cache: Tensor,
     value_cache: Tensor,
     slot_mapping: Tensor,
-    flash_attn: bool,
 }
 
 impl ReshapeCache {
@@ -602,14 +601,16 @@ impl ReshapeCache {
             )
         }
 
-        if kc_rank != 4 && self.flash_attn {
+        #[cfg(feature = "flash-decoding")]
+        if kc_rank != 4 {
             candle::bail!(
                 "flash-attention expects `key_cache` tensor to be of rank 4 \
                     (key_cache: {kc_l:?})"
             )
         }
 
-        if kc_rank != 5 && !self.flash_attn {
+        #[cfg(not(feature = "flash-decoding"))]
+        if kc_rank != 5 {
             candle::bail!(
                 "paged-attention expects `key_cache` tensor to be of rank 5 \
                     (key_cache: {kc_l:?})"
@@ -642,11 +643,15 @@ impl ReshapeCache {
             candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
         }
 
-        let (block_size, x) = if self.flash_attn {
+        #[cfg(feature = "flash-decoding")]
+        let (block_size, x) = {
             // [num_blocks, block_size, num_heads, head_size]
             let (_, block_size, _, _) = kc_l.shape().dims4()?;
             (block_size, 1)
-        } else {
+        };
+
+        #[cfg(not(feature = "flash-decoding"))]
+        let (block_size, x) = {
             let (num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
             if num_heads_kc != num_heads || head_size_kc != head_size / x {
                 candle::bail!(
@@ -683,7 +688,8 @@ impl ReshapeCache {
         let vc_ptr = *vc.device_ptr() as *const core::ffi::c_void;
         let s_ptr = *s.device_ptr() as *const core::ffi::c_long;
         unsafe {
-            if self.flash_attn {
+            #[cfg(feature = "flash-decoding")]
+            {
                 let block_stride = kc_l.stride()[0];
                 let page_stride = kc_l.stride()[1];
                 let head_stride = kc_l.stride()[2];
@@ -706,7 +712,9 @@ impl ReshapeCache {
                     internal_type,
                     *dev.cu_stream() as i64,
                 );
-            } else {
+            }
+            #[cfg(not(feature = "flash-decoding"))]
+            {
                 kernels::ffi::call_reshape_and_cache(
                     k_ptr,
                     v_ptr,
@@ -933,14 +941,12 @@ pub fn reshape_and_cache(
     key_cache: &Tensor,
     value_cache: &Tensor,
     slot_mapping: &Tensor,
-    flash_attn: bool,
 ) -> Result<()> {
     let op = ReshapeCache {
         value: value.to_owned(),
         key_cache: key_cache.to_owned(),
         value_cache: value_cache.to_owned(),
         slot_mapping: slot_mapping.to_owned(),
-        flash_attn,
     };
     key.inplace_op1(&op)
 }
