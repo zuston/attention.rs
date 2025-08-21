@@ -644,7 +644,7 @@ impl ReshapeCache {
         }
 
         #[cfg(feature = "flash-decoding")]
-        let (block_size, x) = {
+        let (block_size, _x) = {
             // [num_blocks, block_size, num_heads, head_size]
             let (_, block_size, _, _) = kc_l.shape().dims4()?;
             (block_size, 1)

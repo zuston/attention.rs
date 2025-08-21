@@ -82,20 +82,32 @@ impl PagedAttention {
             let q = query
                 .transpose(1, 2)?
                 .reshape(((), attention_heads, head_size))?;
-            let k = key
-                .transpose(1, 2)?
-                .reshape(((), key_value_heads, head_size))?;
-            let v = value
-                .transpose(1, 2)?
-                .reshape(((), key_value_heads, head_size))?;
+            let key = if input_metadata.block_tables.is_none() {
+                let key = key
+                    .transpose(1, 2)?
+                    .reshape(((), key_value_heads, head_size))?;
+                key
+            } else {
+                key.to_owned()
+            };
+
+            let value = if input_metadata.block_tables.is_none() {
+                let value = value
+                    .transpose(1, 2)?
+                    .reshape(((), key_value_heads, head_size))?;
+                value
+            } else {
+                value.to_owned()
+            };
 
             let attn = if self.sliding_window.is_some() {
                 candle_flash_attn::flash_attn_varlen_windowed_softcap(
                     &q,
-                    &k,
-                    &v,
+                    &key,
+                    &value,
                     input_metadata.cu_seqlens_q.as_ref().unwrap(),
                     input_metadata.cu_seqlens_k.as_ref().unwrap(),
+                    &input_metadata.block_tables,
                     input_metadata.max_seqlen_q,
                     input_metadata.max_seqlen_k,
                     self.scale as f32,
@@ -106,10 +118,11 @@ impl PagedAttention {
             } else {
                 candle_flash_attn::flash_attn_varlen_softcap(
                     &q,
-                    &k,
-                    &v,
+                    &key,
+                    &value,
                     input_metadata.cu_seqlens_q.as_ref().unwrap(),
                     input_metadata.cu_seqlens_k.as_ref().unwrap(),
+                    &input_metadata.block_tables,
                     input_metadata.max_seqlen_q,
                     input_metadata.max_seqlen_k,
                     self.scale as f32,
@@ -222,7 +235,8 @@ impl PagedAttention {
         let (batch_size, attention_heads, seq_len, head_size) = query.shape().dims4()?;
         let (_, key_value_heads, _, _) = key.shape().dims4()?;
 
-        let att = if input_metadata.is_prefill {
+        let mut att = if input_metadata.is_prefill && input_metadata.block_tables.is_none() {
+            //prefill - no context cache
             Some(self.forward_prefill(
                 query,
                 key,
@@ -253,6 +267,18 @@ impl PagedAttention {
                 value_cache.as_ref().unwrap(),
                 &slot_mapping,
             )?;
+
+            if input_metadata.is_prefill && input_metadata.block_tables.is_some() {
+                //context cache prefill
+                att = Some(self.forward_prefill(
+                    query,
+                    key_cache.as_ref().unwrap(),
+                    value_cache.as_ref().unwrap(),
+                    attention_mask,
+                    input_metadata,
+                    softcapping,
+                )?);
+            }
         }
 
         if let Some(att) = att {
