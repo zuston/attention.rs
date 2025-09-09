@@ -16,7 +16,10 @@ struct PagedAttention {
     block_tables: Tensor,
     context_lens: Tensor,
     alibi_slopes: Option<Tensor>,
+    cu_query_lens: Option<Tensor>,
+    num_query_tokens: usize,
     max_context_len: usize,
+    sliding_window: i32,
 }
 
 impl PagedAttention {
@@ -118,7 +121,7 @@ impl PagedAttention {
 
         let (num_seqs_bt, max_num_blocks_per_seq) = bt_l.shape().dims2()?;
 
-        if num_seqs_bt != num_seqs {
+        if num_seqs_bt != num_seqs && self.cu_query_lens.as_ref().is_none() {
             candle::bail!(
                 "shape mismatch block_tables {:?}, expected {:?}",
                 bt_l.shape(),
@@ -143,7 +146,7 @@ impl PagedAttention {
             )
         }
 
-        if (num_seqs) != cl_l.shape().dims1()? {
+        if (num_seqs) != cl_l.shape().dims1()? && self.cu_query_lens.as_ref().is_none() {
             candle::bail!(
                 "shape mismatch context_lens {:?}, expected {:?}",
                 cl_l.shape(),
@@ -170,7 +173,51 @@ impl PagedAttention {
         let bt_ptr = *bt.device_ptr() as *const core::ffi::c_int;
         let cl_ptr = *cl.device_ptr() as *const core::ffi::c_int;
 
-        if use_v1 {
+        if let Some(cu_query_lens) = &self.cu_query_lens {
+            let o_stride_tokens = q_l.stride()[0] as i32;
+            let sinks_ptr = std::ptr::null();
+
+            let query_start_len_ptr = {
+                let (cu_query_lens, cu_query_lens_layout) = cu_query_lens.storage_and_layout();
+                let cu_query_lens = match &*cu_query_lens {
+                    candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+                    _ => candle::bail!("cu_query_lens must be a cuda tensor"),
+                };
+                let cu_query_lens = cu_query_lens.slice(cu_query_lens_layout.start_offset()..);
+                *cu_query_lens.device_ptr()
+            };
+
+            unsafe {
+                kernels::ffi::paged_attention_prefill(
+                    out_ptr,
+                    q_ptr,
+                    kc_ptr,
+                    vc_ptr,
+                    num_kv_heads as c_int,
+                    self.softmax_scale,
+                    bt_ptr,
+                    cl_ptr,
+                    block_size as c_int,
+                    self.max_context_len as c_int,
+                    num_seqs_bt as c_int,
+                    num_heads as c_int,
+                    self.num_query_tokens as c_int,
+                    head_size as c_int,
+                    max_num_blocks_per_seq as c_int,
+                    q_stride as c_int,
+                    num_blocks as c_int,
+                    kv_block_stride as c_int,
+                    kv_head_stride as c_int,
+                    internal_type,
+                    self.softcapping,
+                    o_stride_tokens as c_int,
+                    query_start_len_ptr as *const u32,
+                    sinks_ptr as *const f32,
+                    self.sliding_window as c_int,
+                    *dev.cu_stream() as i64,
+                )
+            }
+        } else if use_v1 {
             unsafe {
                 kernels::ffi::paged_attention_v1(
                     out_ptr,
@@ -305,7 +352,7 @@ impl PagedAttention {
             let (alibi_s, alibi_s_l) = alibi_slopes.storage_and_layout();
             let alibi_s = match &*alibi_s {
                 Storage::Metal(alibi_s) => alibi_s,
-                _ => candle_core::bail!("context_lens must be a metal tensor"),
+                _ => candle_core::bail!("alibi_slopes must be a metal tensor"),
             };
             Some((
                 alibi_s.clone(),
@@ -522,7 +569,15 @@ pub fn paged_attention(
     max_context_len: usize,
     softmax_scale: f32,
     softcapping: f32,
+    cu_query_lens: Option<Tensor>,
+    sliding_window: Option<usize>,
 ) -> Result<Tensor> {
+    let sliding_window = if let Some(sliding_window) = sliding_window {
+        sliding_window as i32
+    } else {
+        -1
+    };
+    let num_query_tokens = q.dim(0)?;
     let op = PagedAttention {
         softmax_scale,
         key_cache: key_cache.to_owned(),
@@ -532,6 +587,9 @@ pub fn paged_attention(
         alibi_slopes: alibi_slopes.to_owned().cloned(),
         max_context_len,
         softcapping,
+        cu_query_lens: cu_query_lens.to_owned(),
+        num_query_tokens,
+        sliding_window,
     };
     q.apply_op1(op)
 }

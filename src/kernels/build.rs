@@ -4,6 +4,7 @@ use std::path::PathBuf;
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/pagedattention.cu");
+    println!("cargo:rerun-if-changed=src/prefill_paged_attn.cu");
     println!("cargo:rerun-if-changed=src/copy_blocks_kernel.cu");
     println!("cargo:rerun-if-changed=src/reshape_and_cache_kernel.cu");
     println!("cargo:rerun-if-changed=src/sort.cu");

@@ -214,6 +214,7 @@ impl PagedAttention {
     /// value_cache: shape = [num_blocks, num_kv_heads, head_size,
     ///     block_size]
     /// input_metadata: metadata for paged attention.
+    #[allow(unused_mut)]
     pub fn forward(
         &self,
         query: &Tensor,
@@ -268,6 +269,7 @@ impl PagedAttention {
                 &slot_mapping,
             )?;
 
+            #[cfg(feature = "flash-decoding")]
             if input_metadata.is_prefill && input_metadata.block_tables.is_some() {
                 //context cache prefill
                 att = Some(self.forward_prefill(
@@ -313,6 +315,17 @@ impl PagedAttention {
             input_metadata.max_context_len
         };
 
+        //if flash-decoding (flash-attn with prefill kvcache) feature not enabled, use our custom paged attention for chunked prefill
+        let cu_seqlens_q = if input_metadata.is_prefill && input_metadata.block_tables.is_some() {
+            assert!(
+                input_metadata.cu_seqlens_q.as_ref().is_some(),
+                "Chunked prefill in conventional paged attention requires query lens tensor!"
+            );
+            // println!("chunked prefill with paged attention!");
+            input_metadata.cu_seqlens_q.clone()
+        } else {
+            None
+        };
         //  Args:
         //  output: shape = [num_generation_tokens, num_heads, head_size]
         //
@@ -337,6 +350,8 @@ impl PagedAttention {
             max_context_len,
             self.scale,
             softcapping.unwrap_or(1.0f64) as f32,
+            cu_seqlens_q,
+            self.sliding_window,
         )
     }
 }

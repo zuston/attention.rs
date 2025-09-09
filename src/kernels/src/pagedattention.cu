@@ -687,14 +687,11 @@ void paged_attention_v1_launcher(
 // 1, 2, 4, 64, 128, 256.
 #define CALL_V1_LAUNCHER_BLOCK_SIZE(T)                              \
   switch (block_size) {                                             \
-    case 8:                                                         \
-      CALL_V1_LAUNCHER(T, 8);                                       \
-      break;                                                        \
-    case 16:                                                        \
-      CALL_V1_LAUNCHER(T, 16);                                      \
-      break;                                                        \
     case 32:                                                        \
       CALL_V1_LAUNCHER(T, 32);                                      \
+      break;                                                        \
+    case 64:                                                        \
+      CALL_V1_LAUNCHER(T, 64);                                      \
       break;                                                        \
     default:                                                        \
       break;                                                        \
@@ -869,14 +866,11 @@ void paged_attention_v2_launcher(
 // 1, 2, 4, 64, 128, 256.
 #define CALL_V2_LAUNCHER_BLOCK_SIZE(T)                              \
   switch (block_size) {                                             \
-    case 8:                                                         \
-      CALL_V2_LAUNCHER(T, 8);                                       \
-      break;                                                        \
-    case 16:                                                        \
-      CALL_V2_LAUNCHER(T, 16);                                      \
-      break;                                                        \
     case 32:                                                        \
       CALL_V2_LAUNCHER(T, 32);                                      \
+      break;                                                        \
+    case 64:                                                        \
+      CALL_V2_LAUNCHER(T, 64);                                      \
       break;                                                        \
     default:                                                        \
       break;                                                        \
