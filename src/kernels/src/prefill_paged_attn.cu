@@ -191,13 +191,12 @@ __global__ void chunked_prefill_paged_attention_kernel(
     // Vectorized types for Q and K
     using Q_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
     using K_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
+    using Float_vec = typename Vec<float, VEC_SIZE>::Type;
 
     // Buffers for q, k, and temporary storage
     Q_vec q_vec[NUM_VECS];
     K_vec k_vec[NUM_VECS];
     float qk_block[BLOCK_SIZE];
-    scalar_t zero_value;
-    zero(zero_value);
 
     // Determine active head and token
     const int query_head_idx = kv_head_idx * num_queries_per_kv + qh_base_idx;
@@ -293,29 +292,29 @@ __global__ void chunked_prefill_paged_attention_kernel(
 
         // --- Compute softmax weights and accumulate P·V ---
         float acc_lane = 0.f;
-        K_vec p_vec[NUM_BLOCK_VECS];
+        Float_vec p_vec[NUM_BLOCK_VECS];
         #pragma unroll
         for (int b = 0; b < BLOCK_SIZE; ++b) {
           if (in_contexts[b]) {
               const float P = __expf(qk_block[b] - M);
-              from_float(reinterpret_cast<scalar_t*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE], P);
+              reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = P;
               acc_lane += P;
           } else {
-            reinterpret_cast<scalar_t*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = zero_value;
+            reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = 0.f;
           }
         }
 
         // Load V block and compute weighted sum
         const int64_t v_base_block = (int64_t)physical_block * kv_block_stride + (int64_t)kv_head_idx * kv_head_stride;
-        K_vec v_vec[NUM_BLOCK_VECS];
-        K_vec* v_vec_ptr = reinterpret_cast<K_vec*>(&v_vec);
+        Float_vec v_vec[NUM_BLOCK_VECS];
+        // Float_vec* v_vec_ptr = reinterpret_cast<Float_vec*>(&v_vec);
         for (int k = 0; k < HEAD_SIZE; ++k) {
           const scalar_t* v_row_ptr = &v_cache[v_base_block + (int64_t)k * BLOCK_SIZE];
           for (int b = 0; b < NUM_BLOCK_VECS; b++) {
             const scalar_t* src = v_row_ptr + b * VEC_SIZE;
-            v_vec_ptr[b] = *reinterpret_cast<const K_vec*>(src);
+            Float_vec v = to_float(*reinterpret_cast<const K_vec*>(src));
+            acc_vec[k] += dot(p_vec[b], v);
           }
-          acc_vec[k] += Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(p_vec, v_vec);
         }
 
         L += acc_lane; // update softmax normalization
@@ -501,7 +500,7 @@ extern "C" void paged_attention_prefill(
   const float k_scale = 1.f;                       // fp8 scale (or 1.f)
   const float v_scale = 1.f;                        // fp8 scale (or 1.f)
   if (dtype == 2) {
-    CALL_PREFILL_LAUNCHER_BLOCK_SIZE(float);
+    // CALL_PREFILL_LAUNCHER_BLOCK_SIZE(float);
   } else if (dtype == 0) {
     CALL_PREFILL_LAUNCHER_BLOCK_SIZE(uint16_t);
   } else if (dtype == 1) {
