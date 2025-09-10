@@ -20,7 +20,7 @@ fn main() -> Result<()> {
     }
 
     if !is_target_msvc {
-        builder = builder.arg("-Xcompiler").arg("-fPIC");
+        builder = builder.arg("-Xcompiler").arg("-fPIC").arg("-std=c++17");
     }
 
     println!("cargo:info={builder:?}");
