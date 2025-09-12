@@ -104,6 +104,9 @@ extern "C" void RUST_NAME( \
     for (int row = 0; row < nrows; row++) { \
         T* x_row = x + row * ncols; \
         uint32_t* dst_row = dst + row * ncols; \
+        /* Reset indices for this row on device */ \
+        cudaMemcpyAsync(dst_padded, indices_padded, ncols_pad * sizeof(uint32_t),\
+                        cudaMemcpyHostToDevice, custream);\
         \
         /* Copy the current row's data to the padded device buffer. */ \
         cudaMemcpyAsync(x_padded, x_row, ncols * sizeof(T), cudaMemcpyDeviceToDevice, custream); \

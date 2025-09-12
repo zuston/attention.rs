@@ -3,6 +3,10 @@ use candle_core::{Device, Result, Tensor};
 use paged_attention::{paged_attention, reshape_and_cache};
 #[cfg(feature = "cuda")]
 pub mod sort;
+#[cfg(feature = "cuda")]
+pub use kernels;
+#[cfg(feature = "metal")]
+pub use metal_kernels;
 pub struct InputMetadata {
     pub is_prefill: bool,
     pub slot_mapping: Tensor,

@@ -124,6 +124,126 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn marlin_4bit_f16(
+        inputs: *const c_void,
+        weight: *const c_int,
+        scales: *const c_void,
+        zeros: *const c_void,
+        g_idx: *const c_void,
+        out: *mut c_void,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+        workspace: *const c_void,
+        groupsize: c_int,
+        stream: i64,
+    );
+
+    pub fn marlin_4bit_bf16(
+        inputs: *const c_void,
+        weight: *const c_int,
+        scales: *const c_void,
+        zeros: *const c_void,
+        g_idx: *const c_void,
+        out: *mut c_void,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+        workspace: *const c_void,
+        groupsize: c_int,
+        stream: i64,
+    );
+
+    pub fn marlin_awq_4bit_f16(
+        inputs: *const c_void,
+        weight: *const c_int,
+        scales: *const c_void,
+        zeros: *const c_void,
+        g_idx: *const c_void,
+        out: *mut c_void,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+        workspace: *const c_void,
+        groupsize: c_int,
+        stream: i64,
+    );
+
+    pub fn marlin_awq_4bit_bf16(
+        inputs: *const c_void,
+        weight: *const c_int,
+        scales: *const c_void,
+        zeros: *const c_void,
+        g_idx: *const c_void,
+        out: *mut c_void,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+        workspace: *const c_void,
+        groupsize: c_int,
+        stream: i64,
+    );
+    pub fn gptq_repack(
+        weight: *const c_void,
+        result: *const c_void,
+        m: c_int,
+        n: c_int,
+        stream: i64,
+    );
+
+    pub fn awq_repack(
+        weight: *const c_void,
+        result: *const c_void,
+        k: c_int,
+        n: c_int,
+        bits: c_int,
+        stream: i64,
+    );
+
+    pub fn gemm_half_q_half_alt(
+        a: *const c_void,
+        weight: *const u32,
+        qzeros: *const u32,
+        scales: *const c_void,
+        g_idx: *const i32,
+        out: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        bit: i32,
+        stream: i64,
+    );
+
+    pub fn copy_blocks_bf16(
+        key_cache_ptrs: *mut c_void,
+        value_cache_ptrs: *mut c_void,
+        block_mapping: *const c_void,
+        num_layers: i32,
+        num_pairs: i32,
+        numel_per_block: i32,
+        stream: i64,
+    );
+
+    pub fn copy_blocks_f16(
+        key_cache_ptrs: *mut c_void,
+        value_cache_ptrs: *mut c_void,
+        block_mapping: *const c_void,
+        num_layers: i32,
+        num_pairs: i32,
+        numel_per_block: i32,
+        stream: i64,
+    );
+
+    pub fn copy_blocks_f32(
+        key_cache_ptrs: *mut c_void,
+        value_cache_ptrs: *mut c_void,
+        block_mapping: *const c_void,
+        num_layers: i32,
+        num_pairs: i32,
+        numel_per_block: i32,
+        stream: i64,
+    );
+
     pub fn asort_asc_f32(
         x: *const c_void,
         dst: *mut c_void,

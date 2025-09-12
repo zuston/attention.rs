@@ -430,6 +430,12 @@ __global__ void paged_attention_v1_kernel(
   const int kv_block_stride,
   const int kv_head_stride,
   const float softscapping) {
+  if constexpr (std::is_same<scalar_t, nv_bfloat16>::value) {
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+      return;
+    #endif
+  }
+
   paged_attention_kernel<scalar_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS>(
     /* exp_sums */ nullptr, /* max_logits */ nullptr,
     out, q, k_cache, v_cache, num_kv_heads, scale, block_tables, context_lens,
@@ -460,6 +466,11 @@ __global__ void paged_attention_v2_kernel(
   const int kv_block_stride,
   const int kv_head_stride,
   const float softscapping) {
+  if constexpr (std::is_same<scalar_t, nv_bfloat16>::value) {
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+      return;
+    #endif
+  }
   paged_attention_kernel<scalar_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, PARTITION_SIZE>(
     exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
     block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes,
@@ -726,7 +737,9 @@ extern "C" void paged_attention_v1(
   } else if (dtype == 0) {
     CALL_V1_LAUNCHER_BLOCK_SIZE(uint16_t);
   } else if (dtype == 1) {
+    #ifndef NO_MARLIN_KERNEL //cuda_arc < 800 (no bf16 support)
     CALL_V1_LAUNCHER_BLOCK_SIZE(__nv_bfloat16);
+    #endif
   }
 }
 
@@ -908,7 +921,9 @@ extern "C" void paged_attention_v2(
   } else if (dtype == 0) {
     CALL_V2_LAUNCHER_BLOCK_SIZE(uint16_t);
   } else if (dtype == 1) {
+    #ifndef NO_MARLIN_KERNEL //cuda_arc < 800 (no bf16 support)
     CALL_V2_LAUNCHER_BLOCK_SIZE(__nv_bfloat16);
+    #endif
   }
 }
 

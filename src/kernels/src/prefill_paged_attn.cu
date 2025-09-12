@@ -504,7 +504,9 @@ extern "C" void paged_attention_prefill(
   } else if (dtype == 0) {
     CALL_PREFILL_LAUNCHER_BLOCK_SIZE(uint16_t);
   } else if (dtype == 1) {
+    #ifndef NO_MARLIN_KERNEL //cuda_arc < 800 (no bf16 support)
     CALL_PREFILL_LAUNCHER_BLOCK_SIZE(__nv_bfloat16);
+    #endif
   }
 }
 
