@@ -661,6 +661,48 @@ pub fn paged_attention_v2(
     Ok(())
 }
 
+/// Launches the `chunked_prefill_paged_attention` Metal kernel.
+///
+/// This kernel is optimized for the prefill (prompt processing) stage of attention, where a batch of new tokens is processed.
+/// The strategy is to assign one thread to each token in the query sequence. The dispatch grid is structured to parallelize work across
+/// query heads, key-value heads, and chunks of tokens.
+///
+/// # Dispatch Logic
+/// - **Threadgroup Size:** `(TOKEN_CHUNK_SIZE, 1, 1)`. Each threadgroup processes a chunk of `TOKEN_CHUNK_SIZE` tokens.
+/// - **Grid Dimensions:** `(num_queries_per_kv, num_kv_heads, num_token_chunks)`.
+///   - `width`: Parallelizes over the query heads that map to a single key-value head.
+///   - `height`: Parallelizes over the key-value heads.
+///   - `depth`: Parallelizes over the chunks of query tokens.
+///
+/// # Arguments
+///
+/// * `device` - The Metal device to execute the kernel on.
+/// * `ep` - An `EncoderProvider` to get a command encoder.
+/// * `kernels` - A struct for loading and caching Metal pipeline states.
+/// * `ty` - The data type (`F16`, `BF16`, `F32`) of the tensors.
+/// * `output` - The output buffer for the attention results. Shape: `[num_query_tokens, num_query_heads, head_size]`.
+/// * `q` - The query tensor.
+/// * `k_cache` - The paged key-cache.
+/// * `v_cache` - The paged value-cache.
+/// * `block_tables` - A tensor mapping logical sequence blocks to physical blocks in the cache. Shape: `[num_seqs, max_num_blocks_per_seq]`.
+/// * `seq_lens` - A buffer containing the full context length of each sequence.
+/// * `query_start_len` - A buffer indicating the start token index for each sequence in the flattened query tensor.
+/// * `alibi_slopes` - Optional buffer containing ALiBi slopes for positional bias.
+/// * `sinks` - Optional buffer for sink attention.
+/// * `num_kv_heads` - The number of key-value heads (for Grouped-Query Attention).
+/// * `scale` - The softmax scaling factor (typically `1.0 / sqrt(head_size)`).
+/// * `block_table_stride` - The stride of the `block_tables` tensor (i.e., `max_num_blocks_per_seq`).
+/// * `num_seqs` - The number of sequences in the batch.
+/// * `num_query_heads` - The total number of query heads.
+/// * `num_query_tokens` - The total number of tokens being processed in this prefill run.
+/// * `head_size` - The dimension of each attention head.
+/// * `block_size` - The number of tokens per block in the KV cache.
+/// * `softcapping` - Softcapping value for the tanh activation on attention scores.
+/// * `o_stride_tokens` - The stride of the output tensor's first dimension.
+/// * `sliding_window` - The sliding window size for attention, if applicable.
+/// * `total_num_blocks` - The total number of physical blocks in the KV cache.
+/// * `kv_block_stride` - The stride between blocks in the KV cache.
+/// * `kv_head_stride` - The stride between heads in the KV cache.
 #[allow(clippy::too_many_arguments)]
 pub fn paged_attention_prefill(
     device: &Device,

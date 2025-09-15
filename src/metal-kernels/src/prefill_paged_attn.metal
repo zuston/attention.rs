@@ -1,3 +1,31 @@
+/**
+ * @brief Metal kernel for chunked prefill attention with paged KV-cache.
+ * Copyright (c) 2025, Guoqing Bao.  All rights reserved.
+ * This kernel computes attention during the prefill stage (processing prompt tokens)
+ * using a **paged key-value cache**. Each thread computes the output for a token/head pair.
+ *
+ * This Metal kernel is part of the vllm.rs project:
+ * https://github.com/guoqingbao/attention.rs/tree/main/src/metal-kernels/src/prefill_paged_attn.metal
+ * Features:
+ *  - Support Chunked Prefill (prefilled attention with kvcache)
+ *  - Supports **paged KV-cache** (blocks of tokens stored in memory).
+ *  - Handles **sliding window attention**.
+ *  - Optionally applies **ALiBi positional bias**.
+ *  - Uses **online softmax** for numerical stability.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include <metal_stdlib>
 #include <metal_compute>
 #include <metal_simdgroup>
@@ -813,6 +841,56 @@ struct Qk_dot {
 #define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
 #define UINT32_MAX 0xFFFFFFFF
 
+/**
+ * @brief Performs paged attention for the prefill (prompt processing) stage.
+ *
+ * This kernel is designed to process a batch of new query tokens. The core strategy is to assign a single thread to compute the attention output for a single token.
+ * It uses an online softmax algorithm to compute scores block by block without requiring a large shared memory allocation for the full attention matrix.
+ *
+ * @tparam T The data type of the input and output tensors (e.g., float, half).
+ * @tparam HEAD_SIZE The dimension of each attention head.
+ * @tparam BLOCK_SIZE The number of tokens stored in each block of the KV cache.
+ * @tparam TOKEN_CHUNK_SIZE The number of threads in a threadgroup, where each thread processes one token from a "chunk". This must match the host-side launch configuration.
+ *
+ * @author Guoqing Bao
+ * This kernel is part of the vllm.rs project
+ * @section Dispatch Logic
+ * The kernel is launched with a 3D grid of threadgroups and a 1D threadgroup configuration.
+ * - **Threadgroup Size (threads_per_threadgroup):** `(TOKEN_CHUNK_SIZE, 1, 1)`
+ * - **Grid Size (threadgroups_per_grid):** `(num_queries_per_kv, num_kv_heads, num_token_chunks)`
+ *
+ * This maps the problem as follows:
+ * - `threadgroup_position_in_grid.x` (`qh_base_idx`): The index of the query head within a group that shares a KV head.
+ * - `threadgroup_position_in_grid.y` (`kv_head_idx`): The index of the key-value head.
+ * - `threadgroup_position_in_grid.z` (`token_chunk_idx`): The index of the token chunk.
+ * - `thread_position_in_threadgroup.x` (`tid`): The lane within the token chunk.
+ *
+ * Each thread's unique token is identified by `token_chunk_idx * TOKEN_CHUNK_SIZE + tid`.
+ *
+ * @param out The output buffer for attention results. Shape: `[num_query_tokens, num_query_heads, HEAD_SIZE]`.
+ * @param q The input query tensor. Shape: `[num_query_tokens, num_query_heads, HEAD_SIZE]`.
+ * @param k_cache The paged key-cache.
+ * @param v_cache The paged value-cache.
+ * @param num_kv_heads The number of key-value heads for Grouped-Query Attention.
+ * @param sm_scale The scale factor applied to the QK dot product (e.g., `1/sqrt(HEAD_SIZE)`).
+ * @param block_tables Maps logical sequence blocks to physical cache blocks. Shape: `[num_seqs, max_num_blocks_per_seq]`.
+ * @param seq_lens Contains the full context length of each sequence.
+ * @param block_table_stride Stride of the `block_tables` tensor, equal to `max_num_blocks_per_seq`.
+ * @param num_seqs The number of sequences in the batch.
+ * @param num_query_heads The total number of query heads.
+ * @param num_query_tokens The total number of tokens being processed.
+ * @param softcapping The softcapping value for `tanh` activation on attention scores.
+ * @param o_stride_tokens The stride of the output tensor's first dimension.
+ * @param query_start_len Indicates the start token index for each sequence in the flattened query tensor.
+ * @param alibi_slopes Optional buffer with ALiBi slopes for positional bias.
+ * @param k_scale Unused parameter, kept for signature compatibility.
+ * @param v_scale Unused parameter, kept for signature compatibility.
+ * @param sinks Optional buffer for sink attention.
+ * @param sliding_window The sliding window size for attention, if used.
+ * @param total_num_blocks The total number of physical blocks allocated in the KV cache.
+ * @param kv_block_stride The stride between physical blocks in the KV cache.
+ * @param kv_head_stride The stride between KV heads in the KV cache.
+ **/
 template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
 [[kernel]] void chunked_prefill_paged_attention(
     // Buffer mappings

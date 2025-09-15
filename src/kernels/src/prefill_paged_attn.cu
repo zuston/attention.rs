@@ -7,6 +7,7 @@
  * This CUDA kernel is part of the vllm.rs project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/prefill_paged_attn.cu
  * Features:
+ *  - Support Chunked Prefill (prefilled attention with kvcache)
  *  - Supports **paged KV-cache** (blocks of tokens stored in memory).
  *  - Handles **sliding window attention**.
  *  - Optionally applies **ALiBi positional bias**.
