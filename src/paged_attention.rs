@@ -5,8 +5,8 @@ use candle::CudaStorage;
 use candle::MetalStorage;
 use candle::{CpuStorage, DType, Layout, Result, Shape, Storage, Tensor};
 use candle_core as candle;
+#[allow(unused_imports)]
 use half::{bf16, f16};
-use std::ffi::c_int;
 #[allow(dead_code)]
 struct PagedAttention {
     softmax_scale: f32,
@@ -33,6 +33,7 @@ impl PagedAttention {
     ) -> Result<(CudaStorage, Shape)> {
         use candle::cuda_backend::cudarc::driver::DevicePtr;
         use candle::cuda_backend::WrapErr;
+        use std::ffi::c_int;
         let dtype = q.dtype();
         let internal_type = match dtype {
             DType::F16 => 0,
@@ -375,7 +376,7 @@ impl PagedAttention {
 
         let (num_seqs_bt, max_num_blocks_per_seq) = bt_l.shape().dims2()?;
 
-        if num_seqs_bt != num_seqs {
+        if num_seqs_bt != num_seqs && self.cu_query_lens.as_ref().is_none() {
             candle_core::bail!(
                 "shape mismatch block_tables {:?}, expected {:?}",
                 bt_l.shape(),
@@ -400,7 +401,7 @@ impl PagedAttention {
             )
         }
 
-        if (num_seqs) != cl_l.shape().dims1()? {
+        if (num_seqs) != cl_l.shape().dims1()? && self.cu_query_lens.as_ref().is_none() {
             candle_core::bail!(
                 "shape mismatch context_lens {:?}, expected {:?}",
                 cl_l.shape(),
@@ -424,7 +425,55 @@ impl PagedAttention {
 
         let out = dev.new_buffer(elem_count, dtype, "paged-attention-out")?;
 
-        if use_v1 {
+        if let Some(cu_query_lens) = &self.cu_query_lens {
+            let o_stride_tokens = q_l.stride()[0] as i32;
+
+            let (qs, qs_l) = {
+                let (cu_query_lens, cu_query_lens_layout) = cu_query_lens.storage_and_layout();
+                let qs = match &*cu_query_lens {
+                    candle::Storage::Metal(c) => c,
+                    _ => candle::bail!("cu_query_lens must be a metal tensor"),
+                };
+                (qs.clone(), cu_query_lens_layout)
+            };
+
+            metal_kernels::paged_attention_prefill(
+                dev.device(),
+                &command_buffer,
+                metal_kernels::Kernels::default(),
+                internal_type,
+                &out,
+                q.buffer(),
+                q_l.start_offset() * q.dtype().size_in_bytes(),
+                kc.buffer(),
+                kc_l.start_offset() * kc.dtype().size_in_bytes(),
+                vc.buffer(),
+                vc_l.start_offset() * vc.dtype().size_in_bytes(),
+                bt.buffer(),
+                bt_l.start_offset() * bt.dtype().size_in_bytes(),
+                cl.buffer(),
+                cl_l.start_offset() * cl.dtype().size_in_bytes(),
+                qs.buffer(),
+                qs_l.start_offset() * qs.dtype().size_in_bytes(),
+                alibi_storage_and_offset,
+                None,
+                num_kv_heads as i32,
+                self.softmax_scale,
+                max_num_blocks_per_seq as i32,
+                num_seqs_bt as i32,
+                num_heads as i32,
+                self.num_query_tokens as i32,
+                head_size as i32,
+                block_size as i32,
+                self.softcapping,
+                o_stride_tokens as i32,
+                self.sliding_window as i32,
+                num_blocks as i32,
+                kv_block_stride as i32,
+                kv_head_stride as i32,
+            )
+            .map_err(candle_core::Error::wrap)?;
+        } else if use_v1 {
             metal_kernels::paged_attention_v1(
                 dev.device(),
                 &command_buffer,
@@ -614,6 +663,7 @@ impl ReshapeCache {
         value_cache: &Tensor,
         slot_mapping: &Tensor,
     ) -> Result<()> {
+        use std::ffi::c_int;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
         let dtype = k.dtype();
         let dev = k.device();

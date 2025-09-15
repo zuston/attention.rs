@@ -20,12 +20,14 @@ pub enum PagedAttentionDType {
 const COPY_BLOCKS: &str = include_str!("copy_blocks.metal");
 const RESHAPE_AND_CACHE: &str = include_str!("reshape_and_cache.metal");
 const PAGEDATTENTION: &str = include_str!("pagedattention.metal");
+const PREFILL_PAGEDATTENTION: &str = include_str!("prefill_paged_attn.metal");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
     CopyBlocks,
     ReshapeAndCache,
     PagedAttention,
+    PrefillPagedAttention,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -78,6 +80,7 @@ impl Kernels {
             Source::CopyBlocks => COPY_BLOCKS,
             Source::ReshapeAndCache => RESHAPE_AND_CACHE,
             Source::PagedAttention => PAGEDATTENTION,
+            Source::PrefillPagedAttention => PREFILL_PAGEDATTENTION,
         }
     }
 
@@ -656,4 +659,180 @@ pub fn paged_attention_v2(
         encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_prefill(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: PagedAttentionDType,
+    // Buffers and Offsets
+    output: &Buffer,
+    q: &Buffer,
+    q_offset: usize,
+    k_cache: &Buffer,
+    k_cache_offset: usize,
+    v_cache: &Buffer,
+    v_cache_offset: usize,
+    block_tables: &Buffer,
+    block_tables_offset: usize,
+    seq_lens: &Buffer, // Equivalent to `context_lens` in the v1 kernel
+    seq_lens_offset: usize,
+    query_start_len: &Buffer,
+    query_start_len_offset: usize,
+    alibi_slopes: Option<(MetalStorage, usize)>,
+    sinks: Option<(MetalStorage, usize)>,
+    // Scalar Parameters
+    num_kv_heads: i32,
+    scale: f32,              // sm_scale
+    block_table_stride: i32, // max_num_blocks_per_seq
+    num_seqs: i32,
+    num_query_heads: i32,
+    num_query_tokens: i32,
+    head_size: i32,
+    block_size: i32,
+    softcapping: f32,
+    o_stride_tokens: i32,
+    sliding_window: i32,
+    total_num_blocks: i32,
+    kv_block_stride: i32,
+    kv_head_stride: i32,
+) -> Result<(), MetalKernelError> {
+    // This value must match the `token_chunk_size` used in the .metal instantiation macros
+    const TOKEN_CHUNK_SIZE: u64 = 64;
+
+    // 1. Construct the unique kernel name from its template parameters.
+    let type_name = match ty {
+        PagedAttentionDType::F32 => "float",
+        PagedAttentionDType::BF16 => "bfloat16_t",
+        PagedAttentionDType::F16 => "half",
+    };
+    let name = format!(
+        "chunked_prefill_{}_hs{}_bs{}_tcs{}",
+        type_name, head_size, block_size, TOKEN_CHUNK_SIZE
+    );
+
+    // 2. Load the pipeline. The prefill kernel does not use function constants.
+    let pipeline = kernels.load_pipeline(device, Source::PrefillPagedAttention, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    // NOTE: Unlike the v1 kernel, the chunked prefill kernel is designed to use
+    // registers and local arrays instead of threadgroup memory, so we do not
+    // call `set_threadgroup_memory_length`.
+
+    // 3. Set all kernel arguments, matching the `[[buffer(n)]]` indices.
+    encoder.set_buffer(0, Some(output), 0);
+    encoder.set_buffer(1, Some(q), q_offset as NSUInteger);
+    encoder.set_buffer(2, Some(k_cache), k_cache_offset as NSUInteger);
+    encoder.set_buffer(3, Some(v_cache), v_cache_offset as NSUInteger);
+    encoder.set_bytes(
+        4,
+        size_of_val(&num_kv_heads),
+        &num_kv_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(5, size_of_val(&scale), &scale as *const _ as *const c_void);
+    encoder.set_buffer(6, Some(block_tables), block_tables_offset as NSUInteger);
+    encoder.set_buffer(7, Some(seq_lens), seq_lens_offset as NSUInteger);
+    encoder.set_bytes(
+        8,
+        size_of_val(&block_table_stride),
+        &block_table_stride as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        9,
+        size_of_val(&num_seqs),
+        &num_seqs as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        10,
+        size_of_val(&num_query_heads),
+        &num_query_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        11,
+        size_of_val(&num_query_tokens),
+        &num_query_tokens as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        12,
+        size_of_val(&softcapping),
+        &softcapping as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        13,
+        size_of_val(&o_stride_tokens),
+        &o_stride_tokens as *const _ as *const c_void,
+    );
+    encoder.set_buffer(
+        14,
+        Some(query_start_len),
+        query_start_len_offset as NSUInteger,
+    );
+    if let Some((slop, offset)) = alibi_slopes {
+        encoder.set_buffer(15, Some(slop.buffer()), offset as NSUInteger);
+    }
+    // Set unused k_scale and v_scale for signature compatibility
+    let dummy_scale = 1.0f32;
+    encoder.set_bytes(
+        16,
+        size_of_val(&dummy_scale),
+        &dummy_scale as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        17,
+        size_of_val(&dummy_scale),
+        &dummy_scale as *const _ as *const c_void,
+    );
+    if let Some((sk, offset)) = sinks {
+        encoder.set_buffer(18, Some(sk.buffer()), offset as NSUInteger);
+    }
+    encoder.set_bytes(
+        19,
+        size_of_val(&sliding_window),
+        &sliding_window as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        20,
+        size_of_val(&total_num_blocks),
+        &total_num_blocks as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        21,
+        size_of_val(&kv_block_stride),
+        &kv_block_stride as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        22,
+        size_of_val(&kv_head_stride),
+        &kv_head_stride as *const _ as *const c_void,
+    );
+
+    // 4. Calculate grid and threadgroup dimensions, matching the CUDA launch config.
+    // CUDA: dim3 block(TOKEN_CHUNK_SIZE);
+    let thread_group_size = MTLSize {
+        width: TOKEN_CHUNK_SIZE,
+        height: 1,
+        depth: 1,
+    };
+
+    // CUDA: dim3 grid(num_queries_per_kv, num_kv_heads, num_token_chunks);
+    let num_queries_per_kv = (num_query_heads / num_kv_heads) as u64;
+    let num_token_chunks = (num_query_tokens as u64 + TOKEN_CHUNK_SIZE - 1) / TOKEN_CHUNK_SIZE;
+    let thread_groups_count = MTLSize {
+        width: num_queries_per_kv,
+        height: num_kv_heads as u64,
+        depth: num_token_chunks,
+    };
+
+    // 5. Dispatch the kernel.
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+// Helper function to get size of a value for set_bytes
+fn size_of_val<T>(val: &T) -> u64 {
+    core::mem::size_of_val(val) as u64
 }
