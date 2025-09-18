@@ -1,10 +1,12 @@
-#include <stdint.h>
-#include <limits>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <cstdint>
 #include <type_traits>
-#include "cuda_fp16.h"
-#include "cuda_bf16.h"
+#include <limits>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
-// Custom type trait for floating point types including __half and __nv_bfloat16 ---
+// Custom type trait for floating point types including __half and __nv_bfloat16
 // This helps in selecting the correct padding value for sorting.
 template<typename T> struct is_custom_fp {
     static const bool value = std::is_floating_point_v<T>;
@@ -19,35 +21,77 @@ inline __device__ void swap(T & a, T & b) {
     b = tmp;
 }
 
-// Bitonic Sort
-// This kernel performs one step of the bitonic sort algorithm.
-// It sorts a bitonic sequence in either ascending or descending order.
+// Parallel Bitonic Sort Kernel (modified for 2D processing)
+// Each block in the Y-dimension processes a separate row.
 template <typename T, bool ascending>
-__global__ void bitonic_sort_kernel(T* arr, uint32_t* dst, int j, int k) {
-    // Calculate the global thread ID.
+__global__ void bitonic_sort_kernel(T* arr, uint32_t* dst, int ncols_pad, int j, int k) {
+    // blockIdx.y identifies the row this block is responsible for.
+    const unsigned int row_idx = blockIdx.y;
+
+    // Calculate the base pointers for the current row.
+    T* row_arr = arr + (size_t)row_idx * ncols_pad;
+    uint32_t* row_dst = dst + (size_t)row_idx * ncols_pad;
+
+    // Calculate the global thread ID within the row (X-dimension).
     unsigned int i = threadIdx.x + blockDim.x * blockIdx.x;
+
+    // Ensure thread is within the padded row bounds.
+    if (i >= ncols_pad) return;
+
     // Determine the index of the element to compare with.
     unsigned int ij = i ^ j;
 
     // Ensure the comparison is only done once by the thread with the smaller index.
     if (ij > i) {
-        // Determine the direction of the sort for this stage.
-        // (i & k) == 0 checks if the current thread is in the first half of a bitonic sequence of size k.
-        bool sort_direction = ((i & k) == 0);
+        // Ensure the other index is also within bounds.
+        if (ij < ncols_pad) {
+            // Determine the sort direction for this stage.
+            bool sort_direction = ((i & k) == 0);
 
-        // The comparison logic is simplified.
-        // We swap if the elements are in the wrong order according to the desired global sort direction (ascending)
-        // and the local sort direction for this stage (sort_direction).
-        if ((arr[i] > arr[ij]) == (sort_direction == ascending)) {
-            swap(arr[i], arr[ij]);
-            swap(dst[i], dst[ij]);
+            // Compare and swap elements if they are in the wrong order.
+            if ((row_arr[i] > row_arr[ij]) == (sort_direction == ascending)) {
+                swap(row_arr[i], row_arr[ij]);
+                swap(row_dst[i], row_dst[ij]);
+            }
+        }
+    }
+}
+
+// Kernel to copy original data to padded buffer, set padding values, and initialize indices.
+template <typename T>
+__global__ void prepare_data_kernel(
+    const T* original_data,
+    uint32_t* dst_padded,
+    T* data_padded,
+    int nrows,
+    int ncols,
+    int ncols_pad,
+    T pad_value)
+{
+    // 2D grid-stride loop not strictly necessary if grid is sized perfectly,
+    // but this is more robust.
+    int col = threadIdx.x + blockIdx.x * blockDim.x;
+    int row = threadIdx.y + blockIdx.y * blockDim.y;
+
+    if (row < nrows && col < ncols_pad) {
+        size_t padded_idx = (size_t)row * ncols_pad + col;
+        if (col < ncols) {
+            // Copy original data.
+            size_t original_idx = (size_t)row * ncols + col;
+            data_padded[padded_idx] = original_data[original_idx];
+            // Initialize indices for original data.
+            dst_padded[padded_idx] = col;
+        } else {
+            // Add padding values.
+            data_padded[padded_idx] = pad_value;
+            // Initialize indices for padded data (e.g., with 0 or a sentinel).
+            dst_padded[padded_idx] = 0;
         }
     }
 }
 
 
 // Calculates the next power of 2 for a given integer.
-// This is necessary because the bitonic sort algorithm requires a power-of-2-sized input.
 int next_power_of_2(int x) {
     int n = 1;
     while (n < x) {
@@ -56,7 +100,6 @@ int next_power_of_2(int x) {
     return n;
 }
 
-// This macro generates the extern "C" function for a specific data type and sort order.
 #define ASORT_OP(T, RUST_NAME, ASC) \
 extern "C" void RUST_NAME( \
     void * x1, void * dst1, const int nrows, const int ncols, bool inplace, int64_t stream \
@@ -64,75 +107,70 @@ extern "C" void RUST_NAME( \
     T* x = reinterpret_cast<T*>(x1); \
     uint32_t* dst = reinterpret_cast<uint32_t*>(dst1); \
     const cudaStream_t custream = (cudaStream_t)stream; \
-    /* Padding Calculation */ \
+    \
+    /* If there's nothing to sort, return early. */ \
+    if (nrows == 0 || ncols == 0) return; \
+    \
+    /* Calculate padding and total padded size. */ \
     int ncols_pad = next_power_of_2(ncols); \
+    size_t padded_size_elements = (size_t)nrows * ncols_pad; \
+    \
+    /* Allocate padded device buffers for sorting. */ \
     T* x_padded; \
     uint32_t* dst_padded; \
-    cudaMallocAsync((void**)&x_padded, ncols_pad * sizeof(T), custream); \
-    cudaMallocAsync((void**)&dst_padded, ncols_pad * sizeof(uint32_t), custream); \
-    T* values_padded = nullptr; \
-    if (ncols_pad > ncols) { \
-        values_padded = new T[ncols_pad - ncols]; \
-        T pad_value; \
-        if constexpr (ASC) { \
-            /* For ascending sort, pad with the maximum value. */ \
-            pad_value = std::numeric_limits<T>::max(); \
+    cudaMallocAsync((void**)&x_padded, padded_size_elements * sizeof(T), custream); \
+    cudaMallocAsync((void**)&dst_padded, padded_size_elements * sizeof(uint32_t), custream); \
+    \
+    /* Determine padding value based on sort order */ \
+    T pad_value; \
+    if constexpr (ASC) { \
+        pad_value = std::numeric_limits<T>::max(); \
+    } else { \
+        if constexpr (is_custom_fp<T>::value) { \
+            pad_value = std::numeric_limits<T>::lowest(); \
         } else { \
-            /* For descending sort, pad with the minimum value. */ \
-            if constexpr (is_custom_fp<T>::value) { \
-                /* For float types, lowest() is the most negative value. min() is the smallest positive. */ \
-                pad_value = std::numeric_limits<T>::lowest(); \
-            } else { \
-                /* For integer types, min() is correct. */ \
-                pad_value = std::numeric_limits<T>::min(); \
-            } \
+            pad_value = std::numeric_limits<T>::min(); \
         } \
-        for (int i = 0; i < ncols_pad - ncols; i++) { \
-            values_padded[i] = pad_value; \
-        } \
-        /* Copy padding values to the device once. */ \
-        cudaMemcpyAsync(x_padded + ncols, values_padded, (ncols_pad - ncols) * sizeof(T), cudaMemcpyHostToDevice, custream); \
     } \
-    uint32_t* indices_padded = new uint32_t[ncols_pad]; \
-    for (int i = 0; i < ncols_pad; i++) { \
-        indices_padded[i] = i; \
-    } \
-    cudaMemcpyAsync(dst_padded, indices_padded, ncols_pad * sizeof(uint32_t), cudaMemcpyHostToDevice, custream); \
-    int threads_per_block = 256; \
-    int blocks_per_grid = (ncols_pad + threads_per_block - 1) / threads_per_block; \
-    /* Sorting Loop (per row) */ \
-    for (int row = 0; row < nrows; row++) { \
-        T* x_row = x + row * ncols; \
-        uint32_t* dst_row = dst + row * ncols; \
-        /* Reset indices for this row on device */ \
-        cudaMemcpyAsync(dst_padded, indices_padded, ncols_pad * sizeof(uint32_t),\
-                        cudaMemcpyHostToDevice, custream);\
-        \
-        /* Copy the current row's data to the padded device buffer. */ \
-        cudaMemcpyAsync(x_padded, x_row, ncols * sizeof(T), cudaMemcpyDeviceToDevice, custream); \
-        \
-        /* Bitonic Sort Execution */ \
-        for (int k = 2; k <= ncols_pad; k <<= 1) { \
-            for (int j = k >> 1; j > 0; j >>= 1) { \
-                bitonic_sort_kernel<T, ASC><<<blocks_per_grid, threads_per_block, 0, custream>>>(x_padded, dst_padded, j, k); \
-            } \
+    \
+    /* Launch kernel to prepare data (copy, pad, initialize indices) */ \
+    dim3 threads_per_block_2d(16, 16); \
+    dim3 blocks_per_grid_2d( \
+        (ncols_pad + threads_per_block_2d.x - 1) / threads_per_block_2d.x, \
+        (nrows + threads_per_block_2d.y - 1) / threads_per_block_2d.y \
+    ); \
+    prepare_data_kernel<T><<<blocks_per_grid_2d, threads_per_block_2d, 0, custream>>>( \
+        x, dst_padded, x_padded, nrows, ncols, ncols_pad, pad_value); \
+    \
+    /* Bitonic Sort Execution (on all rows in parallel) */ \
+    int threads_per_block_1d = 256; \
+    dim3 blocks_per_grid_sort( \
+        (ncols_pad + threads_per_block_1d - 1) / threads_per_block_1d, \
+        nrows \
+    ); \
+    \
+    for (int k = 2; k <= ncols_pad; k <<= 1) { \
+        for (int j = k >> 1; j > 0; j >>= 1) { \
+            bitonic_sort_kernel<T, ASC><<<blocks_per_grid_sort, threads_per_block_1d, 0, custream>>>( \
+                x_padded, dst_padded, ncols_pad, j, k); \
         } \
-        /* If in-place, copy the sorted data back to the original array. */ \
-        if (inplace) { \
-            cudaMemcpyAsync(x_row, x_padded, ncols * sizeof(T), cudaMemcpyDeviceToDevice, custream); \
-        } \
-        /* Copy the sorted indices back. */ \
-        cudaMemcpyAsync(dst_row, dst_padded, ncols * sizeof(uint32_t), cudaMemcpyDeviceToDevice, custream); \
     } \
+    \
+    /* If in-place, copy the sorted data back to the original array. */ \
+    if (inplace) { \
+        cudaMemcpy2DAsync(x, ncols * sizeof(T), x_padded, ncols_pad * sizeof(T), \
+                          ncols * sizeof(T), nrows, cudaMemcpyDeviceToDevice, custream); \
+    } \
+    \
+    /* Copy the sorted indices back. */ \
+    cudaMemcpy2DAsync(dst, ncols * sizeof(uint32_t), dst_padded, ncols_pad * sizeof(uint32_t), \
+                      ncols * sizeof(uint32_t), nrows, cudaMemcpyDeviceToDevice, custream); \
+    \
     cudaFreeAsync(x_padded, custream); \
     cudaFreeAsync(dst_padded, custream); \
-    cudaStreamSynchronize(custream); \
-    delete[] indices_padded; \
-    if (values_padded) { \
-        delete[] values_padded; \
-    } \
 }
 
+// Instantiate templates for various types and sort orders
 ASORT_OP(__nv_bfloat16, asort_asc_bf16, true)
 ASORT_OP(__nv_bfloat16, asort_desc_bf16, false)
 
