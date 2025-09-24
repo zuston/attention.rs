@@ -199,6 +199,10 @@ __global__ void chunked_prefill_paged_attention_kernel(
     K_vec k_vec[NUM_VECS];
     float qk_block[BLOCK_SIZE];
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    scalar_t zero_value;
+    zero(zero_value);
+#endif
     // Determine active head and token
     const int query_head_idx = kv_head_idx * num_queries_per_kv + qh_base_idx;
     const bool head_active = (qh_base_idx < num_queries_per_kv) && (query_head_idx < num_query_heads);
@@ -293,29 +297,54 @@ __global__ void chunked_prefill_paged_attention_kernel(
 
         // --- Compute softmax weights and accumulate P·V ---
         float acc_lane = 0.f;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+        K_vec p_vec[NUM_BLOCK_VECS];
+#else
         Float_vec p_vec[NUM_BLOCK_VECS];
+#endif
         #pragma unroll
         for (int b = 0; b < BLOCK_SIZE; ++b) {
           if (in_contexts[b]) {
               const float P = __expf(qk_block[b] - M);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+              from_float(reinterpret_cast<scalar_t*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE], P);
+#else
               reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = P;
+#endif
               acc_lane += P;
           } else {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            reinterpret_cast<scalar_t*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = zero_value;
+#else
             reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = 0.f;
+#endif
           }
         }
 
         // Load V block and compute weighted sum
         const int64_t v_base_block = (int64_t)physical_block * kv_block_stride + (int64_t)kv_head_idx * kv_head_stride;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+        K_vec v_vec[NUM_BLOCK_VECS];
+        K_vec* v_vec_ptr = reinterpret_cast<K_vec*>(&v_vec);
+#else
         Float_vec v_vec[NUM_BLOCK_VECS];
+#endif
+
         // Float_vec* v_vec_ptr = reinterpret_cast<Float_vec*>(&v_vec);
         for (int k = 0; k < HEAD_SIZE; ++k) {
           const scalar_t* v_row_ptr = &v_cache[v_base_block + (int64_t)k * BLOCK_SIZE];
           for (int b = 0; b < NUM_BLOCK_VECS; b++) {
             const scalar_t* src = v_row_ptr + b * VEC_SIZE;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            v_vec_ptr[b] = *reinterpret_cast<const K_vec*>(src);
+#else
             Float_vec v = to_float(*reinterpret_cast<const K_vec*>(src));
             acc_vec[k] += dot(p_vec[b], v);
+#endif
           }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+          acc_vec[k] += Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(p_vec, v_vec);
+#endif
         }
 
         L += acc_lane; // update softmax normalization
