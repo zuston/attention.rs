@@ -583,12 +583,12 @@ impl candle::CustomOp1 for PagedAttention {
         };
         let (bt_s, bt_l) = self.block_tables.storage_and_layout();
         let bt_slice = match &*bt_s {
-            Storage::Cpu(cpu) => cpu.as_slice::<f32>()?,
+            Storage::Cpu(cpu) => cpu.as_slice::<u32>()?,
             _ => candle::bail!("block_tables must be a cpu tensor"),
         };
         let (cl_s, cl_l) = self.context_lens.storage_and_layout();
         let cl_slice = match &*cl_s {
-            Storage::Cpu(cpu) => cpu.as_slice::<f32>()?,
+            Storage::Cpu(cpu) => cpu.as_slice::<u32>()?,
             _ => candle::bail!("context_lens must be a cpu tensor"),
         };
 
