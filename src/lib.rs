@@ -78,6 +78,7 @@ impl PagedAttention {
         input_metadata: &InputMetadata,
         softcapping: Option<f64>,
     ) -> Result<Tensor> {
+        // query 即为 input_ids
         let (_, attention_heads, _, head_size) = query.shape().dims4()?;
         let (_, key_value_heads, _, _) = key.shape().dims4()?;
 
@@ -154,6 +155,7 @@ impl PagedAttention {
                 let chunk_size = 1024;
                 let mut attn_chunks = vec![];
 
+                // narrow 是说，对 offset 和 len 的区间范围为一个新的 tensor
                 let query_seq = query.narrow(2, start, seq_len)?.contiguous()?;
                 let key_seq = key.narrow(2, start, seq_len)?.contiguous()?;
                 let value_seq = value.narrow(2, start, seq_len)?.contiguous()?;
@@ -288,6 +290,7 @@ impl PagedAttention {
         }
 
         if let Some(att) = att {
+            println!("prefill done!");
             //prefill result
             return Ok(att);
         }

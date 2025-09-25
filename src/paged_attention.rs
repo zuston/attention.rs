@@ -983,8 +983,89 @@ impl candle::InplaceOp1 for ReshapeCache {
         "reshape-cache"
     }
 
-    fn cpu_fwd(&self, _: &mut CpuStorage, _: &Layout) -> Result<()> {
-        candle::bail!("no cpu support for reshape-cache")
+    fn cpu_fwd(&self, k: &mut CpuStorage, k_l: &Layout) -> Result<()> {
+        use candle::{Storage, Layout, Result};
+        // Extract slices for input and caches
+        // Only f32 is supported for now (could add f16/bf16 if needed)
+        let k_slice = k.as_slice::<f32>()?;
+        let (v_s, v_l) = self.value.storage_and_layout();
+        let v_slice = match &*v_s {
+            Storage::Cpu(vcpu) => vcpu.as_slice::<f32>()?,
+            _ => candle::bail!("value must be a cpu tensor"),
+        };
+        let (kc_s, kc_l) = self.key_cache.storage_and_layout();
+        let kc_slice = match &*kc_s {
+            Storage::Cpu(kccpu) => kccpu.as_slice::<f32>()?,
+            _ => candle::bail!("key_cache must be a cpu tensor"),
+        };
+        let (vc_s, vc_l) = self.value_cache.storage_and_layout();
+        let vc_slice = match &*vc_s {
+            Storage::Cpu(vccpu) => vccpu.as_slice::<f32>()?,
+            _ => candle::bail!("value_cache must be a cpu tensor"),
+        };
+        let (s_s, s_l) = self.slot_mapping.storage_and_layout();
+        let slots = match &*s_s {
+            Storage::Cpu(scpu) => scpu.as_slice::<i64>()?,
+            _ => candle::bail!("slot_mapping must be a cpu tensor"),
+        };
+
+        let (num_tokens, num_heads, head_size) = k_l.shape().dims3()?;
+        if (num_tokens, num_heads, head_size) != v_l.shape().dims3()? {
+            candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
+        }
+        let (num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
+        if num_heads_kc != num_heads || head_size_kc * x != head_size {
+            candle::bail!("key_cache shape mismatch");
+        }
+        if (num_blocks, num_heads, head_size, block_size) != vc_l.shape().dims4()? {
+            candle::bail!("value_cache shape mismatch");
+        }
+        if slots.len() != num_tokens {
+            candle::bail!("slot_mapping length mismatch");
+        }
+
+        // Copy data token by token
+        for t in 0..num_tokens {
+            let slot = slots[t] as usize;
+            let block_idx = slot / block_size;
+            let offset_in_block = slot % block_size;
+            for h in 0..num_heads {
+                let src_offset = t * num_heads * head_size + h * head_size;
+                // Key cache: [num_blocks, num_heads, head_size/x, block_size, x]
+                // For f32, x = 1, so head_size_kc * x = head_size
+                // Destination offset for key_cache:
+                // ((((block_idx * num_heads + h) * head_size_kc) * block_size + offset_in_block) * x)
+                let dst_k_offset = ((((block_idx * num_heads + h) * head_size_kc)
+                                     * block_size + offset_in_block) * x) as usize;
+
+                // kc_slice[dst_k_offset..dst_k_offset + head_size]
+                //     .copy_from_slice(&k_slice[src_offset..src_offset + head_size]);
+
+                // Use unsafe pointer copy to allow mutation even if kc_slice is seen as immutable
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        k_slice[src_offset..src_offset + head_size].as_ptr(),
+                        kc_slice.as_ptr().add(dst_k_offset) as *mut f32,
+                        head_size,
+                    );
+                }
+                // Value cache: [num_blocks, num_heads, head_size, block_size]
+                // Offset: (((block_idx * num_heads + h) * head_size * block_size) + offset_in_block * head_size)
+                let dst_v_offset = (((block_idx * num_heads + h) * head_size * block_size)
+                                    + offset_in_block * head_size) as usize;
+
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        vc_slice[dst_v_offset..dst_v_offset + head_size].as_ptr(),
+                        v_slice.as_ptr().add(src_offset) as *mut f32,
+                        head_size,
+                    );
+                }
+                // vc_slice[dst_v_offset..dst_v_offset + head_size]
+                //     .copy_from_slice(&v_slice[src_offset..src_offset + head_size]);
+            }
+        }
+        Ok(())
     }
 
     #[cfg(feature = "cuda")]
