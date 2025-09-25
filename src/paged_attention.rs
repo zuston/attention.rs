@@ -1143,31 +1143,35 @@ impl candle::InplaceOp1 for ReshapeCache {
             candle::bail!("slot_mapping length mismatch");
         }
 
-        // Copy data token by token
+        // Copy data token by token, handling x > 1 correctly for key_cache layout
         for t in 0..num_tokens {
             let slot = slots[t] as usize;
             if slot >= num_blocks * block_size {
-                candle::bail!("slot_mapping index {} out of bounds (max {})", slot, num_blocks * block_size - 1);
+                candle::bail!(
+                    "slot_mapping index {} out of bounds (max {})",
+                    slot,
+                    num_blocks * block_size - 1
+                );
             }
             let block_idx = slot / block_size;
             let offset_in_block = slot % block_size;
+
             for h in 0..num_heads {
                 let src_offset = t * num_heads * head_size + h * head_size;
-                // Key cache: [num_blocks, num_heads, head_size/x, block_size, x]
-                let dst_k_offset = ((((block_idx * num_heads + h) * head_size_kc)
-                                     * block_size + offset_in_block) * x) as usize;
-                // Copy key from input to key_cache
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        k_slice[src_offset..src_offset + head_size].as_ptr(),
-                        kc_slice.as_ptr().add(dst_k_offset) as *mut f32,
-                        head_size,
-                    );
+
+                // Key cache: [num_blocks, num_heads, head_size_kc, block_size, x]
+                for d in 0..head_size {
+                    let dst_k_offset = ((((block_idx * num_heads + h) * head_size_kc + (d / x))
+                                          * block_size + offset_in_block) * x + (d % x)) as usize;
+                    unsafe {
+                        *kc_slice.as_ptr().add(dst_k_offset) as *mut f32 =
+                            k_slice[src_offset + d];
+                    }
                 }
+
                 // Value cache: [num_blocks, num_heads, head_size, block_size]
                 let dst_v_offset = (((block_idx * num_heads + h) * head_size * block_size)
                                     + offset_in_block * head_size) as usize;
-                // Copy value from input to value_cache
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         v_slice[src_offset..src_offset + head_size].as_ptr(),
