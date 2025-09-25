@@ -568,8 +568,69 @@ impl candle::CustomOp1 for PagedAttention {
         "paged-attention"
     }
 
-    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
-        candle::bail!("no cpu support for paged-attention")
+    fn cpu_fwd(&self, q: &CpuStorage, q_l: &Layout) -> Result<(CpuStorage, Shape)> {
+        use candle::{Storage};
+        // Only f32 CPU support
+        let q_slice = q.as_slice::<f32>()?;
+        let (kc_s, kc_l) = self.key_cache.storage_and_layout();
+        let kc_slice = match &*kc_s {
+            Storage::Cpu(cpu) => cpu.as_slice::<f32>()?,
+            _ => candle::bail!("key_cache must be a cpu tensor"),
+        };
+        let (vc_s, vc_l) = self.value_cache.storage_and_layout();
+        let vc_slice = match &*vc_s {
+            Storage::Cpu(cpu) => cpu.as_slice::<f32>()?,
+            _ => candle::bail!("value_cache must be a cpu tensor"),
+        };
+
+        let (num_seqs, num_heads, head_size) = q_l.shape().dims3()?;
+        // Flatten key/value cache to match [num_seqs, num_heads, head_size]
+        // For simplicity assume already matching shapes
+        if kc_l.shape().dims3().is_err() || vc_l.shape().dims3().is_err() {
+            candle::bail!("cpu_fwd expects key/value cache shaped as [num_seqs, num_heads, head_size]")
+        }
+        let (kc_seqs, kc_heads, kc_hsize) = kc_l.shape().dims3()?;
+        let (vc_seqs, vc_heads, vc_hsize) = vc_l.shape().dims3()?;
+        if kc_seqs != num_seqs || kc_heads != num_heads || kc_hsize != head_size {
+            candle::bail!("key_cache shape mismatch for cpu")
+        }
+        if vc_seqs != num_seqs || vc_heads != num_heads || vc_hsize != head_size {
+            candle::bail!("value_cache shape mismatch for cpu")
+        }
+
+        let mut out = vec![0f32; q_slice.len()];
+        for s in 0..num_seqs {
+            for h in 0..num_heads {
+                // compute attention weights for this head
+                let mut logits = vec![0f32; kc_seqs];
+                for t in 0..kc_seqs {
+                    let mut dot = 0f32;
+                    for d in 0..head_size {
+                        let q_idx = s * num_heads * head_size + h * head_size + d;
+                        let k_idx = t * num_heads * head_size + h * head_size + d;
+                        dot += q_slice[q_idx] * kc_slice[k_idx];
+                    }
+                    logits[t] = dot * self.softmax_scale;
+                }
+                // softmax
+                let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_sum: f32 = logits.iter().map(|&x| (x - max_logit).exp()).sum();
+                let weights: Vec<f32> = logits.iter().map(|&x| (x - max_logit).exp() / exp_sum).collect();
+                // weighted sum of values
+                for d in 0..head_size {
+                    let mut acc = 0f32;
+                    for t in 0..kc_seqs {
+                        let v_idx = t * num_heads * head_size + h * head_size + d;
+                        acc += weights[t] * vc_slice[v_idx];
+                    }
+                    let out_idx = s * num_heads * head_size + h * head_size + d;
+                    out[out_idx] = acc;
+                }
+            }
+        }
+
+        let out_storage = CpuStorage::F32(out);
+        Ok((out_storage, q_l.shape().clone()))
     }
 
     #[cfg(feature = "cuda")]
