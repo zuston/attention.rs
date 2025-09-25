@@ -1164,8 +1164,8 @@ impl candle::InplaceOp1 for ReshapeCache {
                     let dst_k_offset = ((((block_idx * num_heads + h) * head_size_kc + (d / x))
                                           * block_size + offset_in_block) * x + (d % x)) as usize;
                     unsafe {
-                        *kc_slice.as_ptr().add(dst_k_offset) as *mut f32 =
-                            k_slice[src_offset + d];
+                        let dst_ptr = kc_slice.as_ptr().add(dst_k_offset) as *mut f32;
+                        *dst_ptr = k_slice[src_offset + d];
                     }
                 }
 
