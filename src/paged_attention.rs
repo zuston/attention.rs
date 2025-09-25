@@ -1124,21 +1124,17 @@ impl candle::InplaceOp1 for ReshapeCache {
         // Copy data token by token
         for t in 0..num_tokens {
             let slot = slots[t] as usize;
+            if slot >= num_blocks * block_size {
+                candle::bail!("slot_mapping index {} out of bounds (max {})", slot, num_blocks * block_size - 1);
+            }
             let block_idx = slot / block_size;
             let offset_in_block = slot % block_size;
             for h in 0..num_heads {
                 let src_offset = t * num_heads * head_size + h * head_size;
                 // Key cache: [num_blocks, num_heads, head_size/x, block_size, x]
-                // For f32, x = 1, so head_size_kc * x = head_size
-                // Destination offset for key_cache:
-                // ((((block_idx * num_heads + h) * head_size_kc) * block_size + offset_in_block) * x)
                 let dst_k_offset = ((((block_idx * num_heads + h) * head_size_kc)
                                      * block_size + offset_in_block) * x) as usize;
-
-                // kc_slice[dst_k_offset..dst_k_offset + head_size]
-                //     .copy_from_slice(&k_slice[src_offset..src_offset + head_size]);
-
-                // Use unsafe pointer copy to allow mutation even if kc_slice is seen as immutable
+                // Copy key from input to key_cache
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         k_slice[src_offset..src_offset + head_size].as_ptr(),
@@ -1147,19 +1143,16 @@ impl candle::InplaceOp1 for ReshapeCache {
                     );
                 }
                 // Value cache: [num_blocks, num_heads, head_size, block_size]
-                // Offset: (((block_idx * num_heads + h) * head_size * block_size) + offset_in_block * head_size)
                 let dst_v_offset = (((block_idx * num_heads + h) * head_size * block_size)
                                     + offset_in_block * head_size) as usize;
-
+                // Copy value from input to value_cache
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        vc_slice[dst_v_offset..dst_v_offset + head_size].as_ptr(),
-                        v_slice.as_ptr().add(src_offset) as *mut f32,
+                        v_slice[src_offset..src_offset + head_size].as_ptr(),
+                        vc_slice.as_ptr().add(dst_v_offset) as *mut f32,
                         head_size,
                     );
                 }
-                // vc_slice[dst_v_offset..dst_v_offset + head_size]
-                //     .copy_from_slice(&v_slice[src_offset..src_offset + head_size]);
             }
         }
         Ok(())
