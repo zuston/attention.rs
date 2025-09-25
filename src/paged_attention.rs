@@ -635,9 +635,9 @@ impl candle::CustomOp1 for PagedAttention {
                 let q_offset = s * num_heads * head_size + h * head_size;
                 let q_vec = &q_slice[q_offset..q_offset + head_size];
 
-                // Collect logits and corresponding value vectors
-                let mut logits = Vec::with_capacity(context_len);
-                let mut v_values = Vec::with_capacity(context_len * head_size);
+                // Preallocate logits and v_values for the sequence head
+                let mut logits = vec![0f32; context_len];
+                let mut v_values = vec![0f32; context_len * head_size];
 
                 for t in 0..context_len {
                     let block_index = t / block_size;
@@ -652,18 +652,24 @@ impl candle::CustomOp1 for PagedAttention {
                     let block_id = bt_row[block_index] as usize;
                     let offset_in_block = t % block_size;
 
-                    let k_offset = ((((block_id * num_heads + h) * head_size_kc)
+                    // Corrected head mapping: for grouped-query/multi-query, map h to kv_head
+                    // For now, assume num_kv_heads divides num_heads
+                    let kv_head = h % num_kv_heads;
+
+                    let k_offset = ((((block_id * num_kv_heads + kv_head) * head_size_kc)
                         * block_size + offset_in_block) * x) as usize;
-                    let v_offset = (((block_id * num_heads + h) * head_size * block_size)
+                    let v_offset = (((block_id * num_kv_heads + kv_head) * head_size * block_size)
                         + offset_in_block * head_size) as usize;
 
                     let mut dot = 0f32;
                     for d in 0..head_size {
                         dot += q_vec[d] * kc_slice[k_offset + d];
                     }
-                    logits.push(dot * self.softmax_scale);
+                    logits[t] = dot * self.softmax_scale;
 
-                    v_values.extend_from_slice(&vc_slice[v_offset..v_offset + head_size]);
+                    // Copy value vector for this token
+                    let v_slice_ref = &vc_slice[v_offset..v_offset + head_size];
+                    v_values[t * head_size..(t + 1) * head_size].copy_from_slice(v_slice_ref);
                 }
 
                 // Softmax
