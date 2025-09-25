@@ -321,8 +321,12 @@ __device__ void paged_attention_kernel(
     const int64_t physical_block_number = static_cast<int64_t>(block_table[block_idx]);
     const int physical_block_offset = (lane % NUM_V_VECS_PER_ROW) * V_VEC_SIZE;
     const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
-    L_vec logits_vec;
-    from_float(logits_vec, *reinterpret_cast<Float_L_vec*>(logits + token_idx - start_token_idx));
+// #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    Float_L_vec logits_vec = *reinterpret_cast<Float_L_vec*>(logits + token_idx - start_token_idx);
+// #else
+//     L_vec logits_vec;
+//     from_float(logits_vec, *reinterpret_cast<Float_L_vec*>(logits + token_idx - start_token_idx));
+// #endif
 
     const scalar_t* v_ptr = v_cache + physical_block_number * kv_block_stride
                                     + kv_head_idx * kv_head_stride;
@@ -342,7 +346,12 @@ __device__ void paged_attention_kernel(
             v_vec_ptr[j] = token_idx + j < context_len ? v_vec_ptr[j] : zero_value;
           }
         }
-        accs[i] += dot(logits_vec, v_vec);
+// #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+        Float_L_vec v = to_float(v_vec);
+        accs[i] += dot(logits_vec, v);
+// #else
+//         accs[i] += dot(logits_vec, v_vec);
+// #endif
       }
     }
   }
