@@ -614,12 +614,22 @@ impl candle::CustomOp1 for PagedAttention {
             candle::bail!("value_cache block_size mismatch");
         }
 
+        let (num_seqs_bt, max_num_blocks_per_seq) = bt_l.shape().dims2()?;
+        if num_seqs_bt != num_seqs {
+            candle::bail!(
+                "shape mismatch block_tables {:?}, expected first dim {}",
+                bt_l.shape(),
+                num_seqs
+            );
+        }
+
         let mut out = vec![0f32; q_slice.len()];
 
         for s in 0..num_seqs {
             let context_len = cl_slice[s] as usize;
-            let bt_row_start = s * (bt_l.shape().dims2()?.1);
-            let bt_row = &bt_slice[bt_row_start..bt_row_start + context_len];
+            let bt_row_start = s * max_num_blocks_per_seq;
+            let bt_row_len = max_num_blocks_per_seq;
+            let bt_row = &bt_slice[bt_row_start..bt_row_start + bt_row_len];
 
             for h in 0..num_heads {
                 let q_offset = s * num_heads * head_size + h * head_size;
@@ -630,7 +640,16 @@ impl candle::CustomOp1 for PagedAttention {
                 let mut v_values = Vec::with_capacity(context_len * head_size);
 
                 for t in 0..context_len {
-                    let block_id = bt_row[t / block_size] as usize;
+                    let block_index = t / block_size;
+                    if block_index >= bt_row.len() {
+                        candle::bail!(
+                            "block index {} out of range for sequence {} (bt_row length {})",
+                            block_index,
+                            s,
+                            bt_row.len()
+                        );
+                    }
+                    let block_id = bt_row[block_index] as usize;
                     let offset_in_block = t % block_size;
 
                     let k_offset = ((((block_id * num_heads + h) * head_size_kc)
