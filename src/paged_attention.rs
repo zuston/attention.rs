@@ -592,7 +592,7 @@ impl candle::CustomOp1 for PagedAttention {
             _ => candle::bail!("context_lens must be a cpu tensor"),
         };
 
-        // Validate shapes similar to metal implementation
+        // Validate shapes similar to metal/cuda implementation
         if q_l.stride().len() != 3 {
             candle::bail!("q must be rank 3");
         }
@@ -615,46 +615,53 @@ impl candle::CustomOp1 for PagedAttention {
 
         let mut out = vec![0f32; q_slice.len()];
 
-        // Iterate sequences and heads
+        // For each sequence
         for s in 0..num_seqs {
             let context_len = cl_slice[s] as usize;
             let bt_row = &bt_slice[s * (bt_l.shape().dims2()?.1)..];
+            // For each head
             for h in 0..num_heads {
-                for q_idx in 0..1 {
-                    // For each query token in this simple implementation we use last token
-                    let q_offset = s * num_heads * head_size + h * head_size;
-                    let q_vec = &q_slice[q_offset..q_offset + head_size];
+                let q_offset = s * num_heads * head_size + h * head_size;
+                let q_vec = &q_slice[q_offset..q_offset + head_size];
 
-                    // gather keys and values from paged cache for this sequence
-                    let mut logits = Vec::with_capacity(context_len);
-                    let mut values = Vec::with_capacity(context_len * head_size);
-                    for t in 0..context_len {
-                        let block_id = bt_row[t / block_size] as usize;
-                        let offset_in_block = t % block_size;
-                        let k_offset = ((((block_id * num_heads + h) * head_size_kc) * block_size + offset_in_block) * x) as usize;
-                        let v_offset = (((block_id * num_heads + h) * head_size * block_size) + offset_in_block * head_size) as usize;
+                // Prepare logits and v_values for current sequence/head
+                let mut logits = vec![0f32; context_len];
+                let mut v_values = vec![0f32; context_len * head_size];
 
-                        let mut dot = 0f32;
-                        for d in 0..head_size {
-                            dot += q_vec[d] * kc_slice[k_offset + d];
-                        }
-                        logits.push(dot * self.softmax_scale);
-                        values.extend_from_slice(&vc_slice[v_offset..v_offset + head_size]);
-                    }
+                // Gather keys and values according to block tables
+                for t in 0..context_len {
+                    let block_id = bt_row[t / block_size] as usize;
+                    let offset_in_block = t % block_size;
+                    // Key cache: [num_blocks, num_heads, head_size/x, block_size, x]
+                    let k_offset = ((((block_id * num_heads + h) * head_size_kc) * block_size + offset_in_block) * x) as usize;
+                    // Value cache: [num_blocks, num_heads, head_size, block_size]
+                    let v_offset = (((block_id * num_heads + h) * head_size * block_size) + offset_in_block * head_size) as usize;
 
-                    // softmax
-                    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let exp_sum: f32 = logits.iter().map(|&x| (x - max_logit).exp()).sum();
-                    let weights: Vec<f32> = logits.iter().map(|&x| (x - max_logit).exp() / exp_sum).collect();
-
-                    // weighted sum of values
+                    // Dot product q_vec . key
+                    let mut dot = 0f32;
                     for d in 0..head_size {
-                        let mut acc = 0f32;
-                        for t in 0..context_len {
-                            acc += weights[t] * values[t * head_size + d];
-                        }
-                        out[q_offset + d] = acc;
+                        dot += q_vec[d] * kc_slice[k_offset + d];
                     }
+                    logits[t] = dot * self.softmax_scale;
+
+                    // Copy value
+                    for d in 0..head_size {
+                        v_values[t * head_size + d] = vc_slice[v_offset + d];
+                    }
+                }
+
+                // Softmax over logits
+                let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum_exp: f32 = logits.iter().map(|&x| (x - max_logit).exp()).sum();
+                let weights: Vec<f32> = logits.iter().map(|&x| (x - max_logit).exp() / sum_exp).collect();
+
+                // Compute weighted sum
+                for d in 0..head_size {
+                    let mut acc = 0f32;
+                    for t in 0..context_len {
+                        acc += weights[t] * v_values[t * head_size + d];
+                    }
+                    out[q_offset + d] = acc;
                 }
             }
         }
