@@ -570,6 +570,7 @@ impl candle::CustomOp1 for PagedAttention {
 
     fn cpu_fwd(&self, q: &CpuStorage, q_l: &Layout) -> Result<(CpuStorage, Shape)> {
         use candle::Storage;
+
         let q_slice = q.as_slice::<f32>()?;
         let (kc_s, kc_l) = self.key_cache.storage_and_layout();
         let kc_slice = match &*kc_s {
@@ -592,7 +593,7 @@ impl candle::CustomOp1 for PagedAttention {
             _ => candle::bail!("context_lens must be a cpu tensor"),
         };
 
-        // Validate shapes similar to metal/cuda implementation
+        // Validate shapes
         if q_l.stride().len() != 3 {
             candle::bail!("q must be rank 3");
         }
@@ -615,47 +616,43 @@ impl candle::CustomOp1 for PagedAttention {
 
         let mut out = vec![0f32; q_slice.len()];
 
-        // For each sequence
         for s in 0..num_seqs {
             let context_len = cl_slice[s] as usize;
-            let bt_row = &bt_slice[s * (bt_l.shape().dims2()?.1)..];
-            // For each head
+            let bt_row_start = s * (bt_l.shape().dims2()?.1);
+            let bt_row = &bt_slice[bt_row_start..bt_row_start + context_len];
+
             for h in 0..num_heads {
                 let q_offset = s * num_heads * head_size + h * head_size;
                 let q_vec = &q_slice[q_offset..q_offset + head_size];
 
-                // Prepare logits and v_values for current sequence/head
-                let mut logits = vec![0f32; context_len];
-                let mut v_values = vec![0f32; context_len * head_size];
+                // Collect logits and corresponding value vectors
+                let mut logits = Vec::with_capacity(context_len);
+                let mut v_values = Vec::with_capacity(context_len * head_size);
 
-                // Gather keys and values according to block tables
                 for t in 0..context_len {
                     let block_id = bt_row[t / block_size] as usize;
                     let offset_in_block = t % block_size;
-                    // Key cache: [num_blocks, num_heads, head_size/x, block_size, x]
-                    let k_offset = ((((block_id * num_heads + h) * head_size_kc) * block_size + offset_in_block) * x) as usize;
-                    // Value cache: [num_blocks, num_heads, head_size, block_size]
-                    let v_offset = (((block_id * num_heads + h) * head_size * block_size) + offset_in_block * head_size) as usize;
 
-                    // Dot product q_vec . key
+                    let k_offset = ((((block_id * num_heads + h) * head_size_kc)
+                        * block_size + offset_in_block) * x) as usize;
+                    let v_offset = (((block_id * num_heads + h) * head_size * block_size)
+                        + offset_in_block * head_size) as usize;
+
                     let mut dot = 0f32;
                     for d in 0..head_size {
                         dot += q_vec[d] * kc_slice[k_offset + d];
                     }
-                    logits[t] = dot * self.softmax_scale;
+                    logits.push(dot * self.softmax_scale);
 
-                    // Copy value
-                    for d in 0..head_size {
-                        v_values[t * head_size + d] = vc_slice[v_offset + d];
-                    }
+                    v_values.extend_from_slice(&vc_slice[v_offset..v_offset + head_size]);
                 }
 
-                // Softmax over logits
+                // Softmax
                 let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let sum_exp: f32 = logits.iter().map(|&x| (x - max_logit).exp()).sum();
-                let weights: Vec<f32> = logits.iter().map(|&x| (x - max_logit).exp() / sum_exp).collect();
+                let exp_sum: f32 = logits.iter().map(|&x| (x - max_logit).exp()).sum();
+                let weights: Vec<f32> = logits.iter().map(|&x| (x - max_logit).exp() / exp_sum).collect();
 
-                // Compute weighted sum
+                // Weighted sum
                 for d in 0..head_size {
                     let mut acc = 0f32;
                     for t in 0..context_len {
