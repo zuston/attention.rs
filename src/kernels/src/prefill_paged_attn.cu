@@ -118,12 +118,13 @@ __device__ inline T make_zero() {
  * @param[in]  kv_block_stride Stride between consecutive KV blocks in memory.
  * @param[in]  kv_head_stride  Stride between consecutive KV heads inside a block.
  */
-template<typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE>
+template<typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE>
 __global__ void chunked_prefill_paged_attention_kernel(
     scalar_t* __restrict__ out,              // [num_all_tokens_new, num_query_heads, HEAD]
     const scalar_t* __restrict__ q,          // [num_all_tokens_new, num_query_heads, HEAD]
-    const scalar_t* __restrict__ k_cache,    // [num_k_blocks, num_kv_heads, HEAD/x, BLOCK_SIZE, x]
-    const scalar_t* __restrict__ v_cache,    // [num_k_blocks, num_kv_heads, HEAD, BLOCK_SIZE]
+    const cache_t* __restrict__ k_cache,    // [num_k_blocks, num_kv_heads, HEAD/x, BLOCK_SIZE, x]
+    const cache_t* __restrict__ v_cache,    // [num_k_blocks, num_kv_heads, HEAD, BLOCK_SIZE]
+    const float k_scale, const float v_scale,
     int32_t num_kv_heads,
     float sm_scale,
     const uint32_t* __restrict__ block_tables,
@@ -136,14 +137,13 @@ __global__ void chunked_prefill_paged_attention_kernel(
     int32_t o_stride_tokens,
     const uint32_t* __restrict__ query_start_len,
     const float* __restrict__ alibi_slopes,
-    float k_scale,//not used
-    float v_scale,//not used
     const float* __restrict__ sinks,//not used
     int32_t sliding_window,
     int32_t total_num_blocks,
     int32_t kv_block_stride,
     int32_t kv_head_stride
 ) {
+    const bool is_quantized = !std::is_same<scalar_t, cache_t>::value;
     constexpr int THREAD_GROUP_SIZE = 1;
     constexpr int VEC_SIZE = 16 / sizeof(scalar_t);
     constexpr int NUM_VECS  = HEAD_SIZE / VEC_SIZE;
@@ -162,7 +162,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
     int64_t v_cache_num_elems = total_num_blocks * kv_block_stride;
 
     const int num_queries_per_kv = num_query_heads / num_kv_heads;
-    const int X = 16 / sizeof(scalar_t); // sub-vector size
+    const int X = 16 / sizeof(cache_t); // sub-vector size
     const bool use_alibi = (alibi_slopes != nullptr);
     const bool use_sinks  = (sinks != nullptr);
 
@@ -193,6 +193,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
     using Q_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
     using K_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
     using Float_vec = typename Vec<float, VEC_SIZE>::Type;
+    using Quant_vec = typename Vec<cache_t, VEC_SIZE>::Type;
 
     // Buffers for q, k, and temporary storage
     Q_vec q_vec[NUM_VECS];
@@ -263,7 +264,14 @@ __global__ void chunked_prefill_paged_attention_kernel(
               int gy = d / X;
               int64_t k_idx = physical_block * kv_block_stride + kv_head_idx * kv_head_stride +
                               gy * (BLOCK_SIZE * X) + b * X;
-              k_vec[k] = *reinterpret_cast<const K_vec*>(&k_cache[k_idx]);
+              
+              if constexpr (!is_quantized) {
+                k_vec[k] = *reinterpret_cast<const K_vec*>(&k_cache[k_idx]);
+              } else {
+                Quant_vec fp8_k_vec = *reinterpret_cast<const Quant_vec*>(
+                    &k_cache[k_idx]);
+                k_vec[k] = vllm::fp8::scaled_convert<K_vec, Quant_vec>(fp8_k_vec, k_scale);
+              }
             }
 
             // Compute dot product q·k
@@ -297,54 +305,38 @@ __global__ void chunked_prefill_paged_attention_kernel(
 
         // --- Compute softmax weights and accumulate P·V ---
         float acc_lane = 0.f;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-        K_vec p_vec[NUM_BLOCK_VECS];
-#else
         Float_vec p_vec[NUM_BLOCK_VECS];
-#endif
+
         #pragma unroll
         for (int b = 0; b < BLOCK_SIZE; ++b) {
           if (in_contexts[b]) {
               const float P = __expf(qk_block[b] - M);
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-              from_float(reinterpret_cast<scalar_t*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE], P);
-#else
               reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = P;
-#endif
               acc_lane += P;
           } else {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-            reinterpret_cast<scalar_t*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = zero_value;
-#else
             reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = 0.f;
-#endif
           }
         }
 
         // Load V block and compute weighted sum
         const int64_t v_base_block = (int64_t)physical_block * kv_block_stride + (int64_t)kv_head_idx * kv_head_stride;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-        K_vec v_vec[NUM_BLOCK_VECS];
-        K_vec* v_vec_ptr = reinterpret_cast<K_vec*>(&v_vec);
-#else
         Float_vec v_vec[NUM_BLOCK_VECS];
-#endif
 
         // Float_vec* v_vec_ptr = reinterpret_cast<Float_vec*>(&v_vec);
         for (int k = 0; k < HEAD_SIZE; ++k) {
-          const scalar_t* v_row_ptr = &v_cache[v_base_block + (int64_t)k * BLOCK_SIZE];
+          const cache_t* v_row_ptr = &v_cache[v_base_block + (int64_t)k * BLOCK_SIZE];
           for (int b = 0; b < NUM_BLOCK_VECS; b++) {
-            const scalar_t* src = v_row_ptr + b * VEC_SIZE;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-            v_vec_ptr[b] = *reinterpret_cast<const K_vec*>(src);
-#else
-            Float_vec v = to_float(*reinterpret_cast<const K_vec*>(src));
+            const cache_t* src = v_row_ptr + b * VEC_SIZE;
+            Float_vec v;
+            if constexpr (!is_quantized) {
+              v = to_float(*reinterpret_cast<const K_vec*>(src));
+            } else {
+              Quant_vec fp8_v_vec = *reinterpret_cast<const Quant_vec *>(src);
+              v = vllm::fp8::scaled_convert<Float_vec, Quant_vec>(fp8_v_vec, v_scale);
+            }
+
             acc_vec[k] += dot(p_vec[b], v);
-#endif
           }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-          acc_vec[k] += Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(p_vec, v_vec);
-#endif
         }
 
         L += acc_lane; // update softmax normalization
@@ -371,12 +363,13 @@ __global__ void chunked_prefill_paged_attention_kernel(
 }
 
 #define LAUNCH_PAGED_ATTENTION_PREFILL(HEAD_SIZE)   \
-  vllm_rs::chunked_prefill_paged_attention_kernel<T, HEAD_SIZE, BLOCK_SIZE>  \
+  vllm_rs::chunked_prefill_paged_attention_kernel<T, cache_T, HEAD_SIZE, BLOCK_SIZE>  \
   <<<grid, block, 0, stream>>>(                                                 \
     reinterpret_cast<T*>(out),                                                                \
     reinterpret_cast<T*>(query),                                                              \
-    reinterpret_cast<T*>(key_cache),                                                          \
-    reinterpret_cast<T*>(value_cache),                                                        \
+    reinterpret_cast<cache_T*>(key_cache),                                                          \
+    reinterpret_cast<cache_T*>(value_cache),                                                        \
+    k_scale, v_scale,                                                                       \
     num_kv_heads,                                                                             \
     scale,                                                                                    \
     block_tables,                                                                             \
@@ -389,8 +382,6 @@ __global__ void chunked_prefill_paged_attention_kernel(
     o_stride_tokens,\
     query_start_len,\
     alibi_slopes_ptr,                                                                         \
-    k_scale,\
-    v_scale,\
     sinks,\
     sliding_window,\
     num_blocks, \
@@ -400,6 +391,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
 
 template<
   typename T,
+  typename cache_T,
   int BLOCK_SIZE
   >
 void paged_attention_prefill_launcher(
@@ -407,6 +399,8 @@ void paged_attention_prefill_launcher(
   void *query,
   void *key_cache,
   void *value_cache,
+  float k_scale,
+  float v_scale,
   int32_t num_kv_heads,
   float scale,
   uint32_t *block_tables,
@@ -427,8 +421,6 @@ void paged_attention_prefill_launcher(
   int64_t stream_) {
 
   const float* alibi_slopes_ptr = nullptr;
-  const float k_scale = 1.f;
-  const float v_scale = 1.f;
   const int num_queries_per_kv = num_query_heads / num_kv_heads;
   int VEC_SIZE = 16 / sizeof(T);
   int NUM_VECS  = head_size / VEC_SIZE;
@@ -458,12 +450,14 @@ void paged_attention_prefill_launcher(
   }
 }
 
-#define CALL_PREFILL_LAUNCHER(T, BLOCK_SIZE)                             \
-  paged_attention_prefill_launcher<T, BLOCK_SIZE>(                       \
+#define CALL_PREFILL_LAUNCHER(T, cache_T, BLOCK_SIZE)                             \
+  paged_attention_prefill_launcher<T, cache_T, BLOCK_SIZE>(                       \
     out,                                                            \
     query,                                                          \
     key_cache,                                                      \
     value_cache,                                                    \
+    k_scale,                                                      \
+    v_scale,                                                    \
     num_kv_heads,                                                   \
     scale,                                                          \
     block_tables,                                                   \
@@ -483,13 +477,13 @@ void paged_attention_prefill_launcher(
     kv_head_stride,\
     stream);
 
-#define CALL_PREFILL_LAUNCHER_BLOCK_SIZE(T)                              \
+#define CALL_PREFILL_LAUNCHER_BLOCK_SIZE(T, cache_T)                              \
   switch (block_size) {                                             \
     case 32:                                                        \
-      CALL_PREFILL_LAUNCHER(T, 32);                                      \
+      CALL_PREFILL_LAUNCHER(T, cache_T, 32);                                      \
       break;                                                        \
     case 64:                                                        \
-      CALL_PREFILL_LAUNCHER(T, 64);                                      \
+      CALL_PREFILL_LAUNCHER(T, cache_T, 64);                                      \
       break;                                                        \
     default:                                                        \
       break;                                                        \
@@ -500,6 +494,8 @@ extern "C" void paged_attention_prefill(
   void *query,           // [num_seqs, num_heads, head_size]
   void *key_cache,       // [num_blocks, num_heads, head_size/x, block_size, x]
   void *value_cache,     // [num_blocks, num_heads, head_size, block_size]
+  float k_scale,
+  float v_scale,
   int32_t num_kv_heads,               // [num_heads]
   float scale,
   uint32_t *block_tables,    // [num_seqs, max_num_blocks_per_seq]
@@ -527,16 +523,30 @@ extern "C" void paged_attention_prefill(
   int64_t stream
   ) {
 
-  const float k_scale = 1.f;                       // fp8 scale (or 1.f)
-  const float v_scale = 1.f;                        // fp8 scale (or 1.f)
-  if (dtype == 2) {
-    // CALL_PREFILL_LAUNCHER_BLOCK_SIZE(float);
-  } else if (dtype == 0) {
-    CALL_PREFILL_LAUNCHER_BLOCK_SIZE(uint16_t);
-  } else if (dtype == 1) {
-    #ifndef NO_MARLIN_KERNEL //cuda_arc < 800 (no bf16 support)
-    CALL_PREFILL_LAUNCHER_BLOCK_SIZE(__nv_bfloat16);
-    #endif
+  if (k_scale != 1.f || v_scale != 1.f) {
+#ifndef NO_FP8_KVCACHE
+    if (dtype == 2) {
+      // CALL_PREFILL_LAUNCHER_BLOCK_SIZE(float);
+    } else if (dtype == 0) {
+      CALL_PREFILL_LAUNCHER_BLOCK_SIZE(uint16_t, uint8_t);
+    } else if (dtype == 1) {
+      #ifndef NO_BF16_KERNEL //cuda_arc < 800 (no bf16 support)
+      CALL_PREFILL_LAUNCHER_BLOCK_SIZE(__nv_bfloat16, uint8_t);
+      #endif
+    }
+#else
+    throw std::runtime_error("FP8 KV-cache is disabled.");
+#endif
+  } else {
+    if (dtype == 2) {
+      // CALL_PREFILL_LAUNCHER_BLOCK_SIZE(float);
+    } else if (dtype == 0) {
+      CALL_PREFILL_LAUNCHER_BLOCK_SIZE(uint16_t, uint16_t);
+    } else if (dtype == 1) {
+      #ifndef NO_BF16_KERNEL //cuda_arc < 800 (no bf16 support)
+      CALL_PREFILL_LAUNCHER_BLOCK_SIZE(__nv_bfloat16, __nv_bfloat16);
+      #endif
+    }
   }
 }
 

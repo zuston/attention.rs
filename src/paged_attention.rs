@@ -13,6 +13,8 @@ struct PagedAttention {
     softcapping: f32,
     key_cache: Tensor,
     value_cache: Tensor,
+    k_scale: Option<f32>,
+    v_scale: Option<f32>,
     block_tables: Tensor,
     context_lens: Tensor,
     alibi_slopes: Option<Tensor>,
@@ -96,15 +98,31 @@ impl PagedAttention {
 
         // Get cuda slices for all tensors
         let q = q.as_cuda_slice::<T>()?;
-        let kc = kc.as_cuda_slice::<T>()?;
-        let vc = vc.as_cuda_slice::<T>()?;
+        let kc_ptr = if self.k_scale.is_some() {
+            let kc = kc.as_cuda_slice::<u8>()?;
+            let kc = kc.slice(kc_l.start_offset()..);
+            *kc.device_ptr() as *const core::ffi::c_void
+        } else {
+            let kc = kc.as_cuda_slice::<T>()?;
+            let kc = kc.slice(kc_l.start_offset()..);
+            *kc.device_ptr() as *const core::ffi::c_void
+        };
+
+        let vc_ptr = if self.v_scale.is_some() {
+            let vc = vc.as_cuda_slice::<u8>()?;
+            let vc = vc.slice(vc_l.start_offset()..);
+            *vc.device_ptr() as *const core::ffi::c_void
+        } else {
+            let vc = vc.as_cuda_slice::<T>()?;
+            let vc = vc.slice(vc_l.start_offset()..);
+            *vc.device_ptr() as *const core::ffi::c_void
+        };
+
         let cl = cl.as_cuda_slice::<u32>()?; // Should be i32!
         let bt = bt.as_cuda_slice::<u32>()?; // Should be i32!
 
         // Get cuda views for all tensors
         let q = q.slice(q_l.start_offset()..);
-        let kc = kc.slice(kc_l.start_offset()..);
-        let vc = vc.slice(vc_l.start_offset()..);
         let cl = cl.slice(cl_l.start_offset()..);
         let bt = bt.slice(bt_l.start_offset()..);
 
@@ -169,8 +187,6 @@ impl PagedAttention {
 
         let out_ptr = *out.device_ptr() as *const core::ffi::c_void;
         let q_ptr = *q.device_ptr() as *const core::ffi::c_void;
-        let kc_ptr = *kc.device_ptr() as *const core::ffi::c_void;
-        let vc_ptr = *vc.device_ptr() as *const core::ffi::c_void;
         let bt_ptr = *bt.device_ptr() as *const core::ffi::c_int;
         let cl_ptr = *cl.device_ptr() as *const core::ffi::c_int;
 
@@ -194,6 +210,8 @@ impl PagedAttention {
                     q_ptr,
                     kc_ptr,
                     vc_ptr,
+                    self.k_scale.unwrap_or(1.0),
+                    self.v_scale.unwrap_or(1.0),
                     num_kv_heads as c_int,
                     self.softmax_scale,
                     bt_ptr,
@@ -225,6 +243,8 @@ impl PagedAttention {
                     q_ptr,
                     kc_ptr,
                     vc_ptr,
+                    self.k_scale.unwrap_or(1.0),
+                    self.v_scale.unwrap_or(1.0),
                     num_kv_heads as c_int,
                     self.softmax_scale,
                     bt_ptr,
@@ -263,6 +283,8 @@ impl PagedAttention {
                     q_ptr,
                     kc_ptr,
                     vc_ptr,
+                    self.k_scale.unwrap_or(1.0),
+                    self.v_scale.unwrap_or(1.0),
                     num_kv_heads as c_int,
                     self.softmax_scale,
                     bt_ptr,
@@ -612,6 +634,8 @@ pub fn paged_attention(
     q: &Tensor,
     key_cache: &Tensor,
     value_cache: &Tensor,
+    k_scale: Option<f32>,
+    v_scale: Option<f32>,
     block_tables: &Tensor,
     context_lens: &Tensor,
     alibi_slopes: Option<&Tensor>,
@@ -631,6 +655,8 @@ pub fn paged_attention(
         softmax_scale,
         key_cache: key_cache.to_owned(),
         value_cache: value_cache.to_owned(),
+        k_scale,
+        v_scale,
         block_tables: block_tables.to_owned(),
         context_lens: context_lens.to_owned(),
         alibi_slopes: alibi_slopes.to_owned().cloned(),
@@ -647,6 +673,8 @@ struct ReshapeCache {
     value: Tensor,
     key_cache: Tensor,
     value_cache: Tensor,
+    k_scale: Option<f32>,
+    v_scale: Option<f32>,
     slot_mapping: Tensor,
 }
 
@@ -663,8 +691,8 @@ impl ReshapeCache {
         value_cache: &Tensor,
         slot_mapping: &Tensor,
     ) -> Result<()> {
-        use std::ffi::c_int;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use std::ffi::c_int;
         let dtype = k.dtype();
         let dev = k.device();
         let internal_type = match dtype {
@@ -690,6 +718,26 @@ impl ReshapeCache {
         let vc = match &*vc {
             Storage::Cuda(vc) => vc,
             _ => candle::bail!("value_cache must be a cuda tensor"),
+        };
+
+        let kc_ptr = if self.k_scale.is_some() {
+            let kc = kc.as_cuda_slice::<u8>()?;
+            let kc = kc.slice(kc_l.start_offset()..);
+            *kc.device_ptr() as *const core::ffi::c_void
+        } else {
+            let kc = kc.as_cuda_slice::<T>()?;
+            let kc = kc.slice(kc_l.start_offset()..);
+            *kc.device_ptr() as *const core::ffi::c_void
+        };
+
+        let vc_ptr = if self.v_scale.is_some() {
+            let vc = vc.as_cuda_slice::<u8>()?;
+            let vc = vc.slice(vc_l.start_offset()..);
+            *vc.device_ptr() as *const core::ffi::c_void
+        } else {
+            let vc = vc.as_cuda_slice::<T>()?;
+            let vc = vc.slice(vc_l.start_offset()..);
+            *vc.device_ptr() as *const core::ffi::c_void
         };
 
         let (s, s_l) = slot_mapping.storage_and_layout();
@@ -735,15 +783,11 @@ impl ReshapeCache {
         // Get cuda slices for all tensors
         let k = k.as_cuda_slice::<T>()?;
         let v = v.as_cuda_slice::<T>()?;
-        let kc = kc.as_cuda_slice::<T>()?;
-        let vc = vc.as_cuda_slice::<T>()?;
         let s = s.as_cuda_slice::<i64>()?;
 
         // Get cuda views for all tensors
         let k = k.slice(k_l.start_offset()..);
         let v = v.slice(v_l.start_offset()..);
-        let kc = kc.slice(kc_l.start_offset()..);
-        let vc = vc.slice(vc_l.start_offset()..);
         let s = s.slice(s_l.start_offset()..);
 
         let (num_tokens, num_heads, head_size) = k_l.shape().dims3()?;
@@ -792,12 +836,14 @@ impl ReshapeCache {
 
         let k_ptr = *k.device_ptr() as *const core::ffi::c_void;
         let v_ptr = *v.device_ptr() as *const core::ffi::c_void;
-        let kc_ptr = *kc.device_ptr() as *const core::ffi::c_void;
-        let vc_ptr = *vc.device_ptr() as *const core::ffi::c_void;
         let s_ptr = *s.device_ptr() as *const core::ffi::c_long;
         unsafe {
             #[cfg(feature = "flash-decoding")]
             {
+                assert!(
+                    !self.k_scale.is_none() && !self.v_scale.is_none(),
+                    "fp8 kvcache is not supported under flash attention!"
+                );
                 let block_stride = kc_l.stride()[0];
                 let page_stride = kc_l.stride()[1];
                 let head_stride = kc_l.stride()[2];
@@ -807,7 +853,9 @@ impl ReshapeCache {
                     v_ptr,  // [num_tokens, num_heads, head_size]
                     kc_ptr, // [num_blocks, block_size, num_heads, head_size]
                     vc_ptr, // [num_blocks, block_size, num_heads, head_size]
-                    s_ptr,  // [num_tokens]
+                    self.k_scale.unwrap_or(1.0),
+                    self.v_scale.unwrap_or(1.0),
+                    s_ptr, // [num_tokens]
                     num_tokens as c_int,
                     num_heads as c_int,
                     head_size as c_int,
@@ -828,6 +876,8 @@ impl ReshapeCache {
                     v_ptr,
                     kc_ptr,
                     vc_ptr,
+                    self.k_scale.unwrap_or(1.0),
+                    self.v_scale.unwrap_or(1.0),
                     s_ptr,
                     num_tokens as c_int,
                     num_heads as c_int,
@@ -1048,12 +1098,16 @@ pub fn reshape_and_cache(
     value: &Tensor,
     key_cache: &Tensor,
     value_cache: &Tensor,
+    k_scale: Option<f32>,
+    v_scale: Option<f32>,
     slot_mapping: &Tensor,
 ) -> Result<()> {
     let op = ReshapeCache {
         value: value.to_owned(),
         key_cache: key_cache.to_owned(),
         value_cache: value_cache.to_owned(),
+        k_scale,
+        v_scale,
         slot_mapping: slot_mapping.to_owned(),
     };
     key.inplace_op1(&op)

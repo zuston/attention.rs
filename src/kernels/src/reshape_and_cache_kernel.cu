@@ -8,15 +8,17 @@
 #include <cassert>
 #include <map>
 #include <vector>
-
+#include "attention/attention_dtypes.h"
+#include "attention/attention_utils.cuh"
 namespace vllm {
 
-template<typename scalar_t>
+template<typename scalar_t, typename cache_t>
 __global__ void reshape_and_cache_kernel(
   const scalar_t* __restrict__ key,           // [num_tokens, num_heads, head_size]
   const scalar_t* __restrict__ value,         // [num_tokens, num_heads, head_size]
-  scalar_t* __restrict__ key_cache,           // [num_blocks, num_heads, head_size/x, block_size, x]
-  scalar_t* __restrict__ value_cache,         // [num_blocks, num_heads, head_size, block_size]
+  cache_t* __restrict__ key_cache,           // [num_blocks, num_heads, head_size/x, block_size, x]
+  cache_t* __restrict__ value_cache,         // [num_blocks, num_heads, head_size, block_size]
+  const float k_scale, const float v_scale,
   const int64_t* __restrict__ slot_mapping,   // [num_tokens]
   const int key_stride,
   const int value_stride,
@@ -24,6 +26,7 @@ __global__ void reshape_and_cache_kernel(
   const int head_size,
   const int block_size,
   const int x) {
+  const bool is_quantized = !std::is_same<scalar_t, cache_t>::value;
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
   if (slot_idx < 0) {
@@ -53,17 +56,24 @@ __global__ void reshape_and_cache_kernel(
                                   + head_idx * head_size * block_size
                                   + head_offset * block_size
                                   + block_offset;
-    key_cache[tgt_key_idx] = key[src_key_idx];
-    value_cache[tgt_value_idx] = value[src_value_idx];
+    if constexpr (!is_quantized) {
+      key_cache[tgt_key_idx] = key[src_key_idx];
+      value_cache[tgt_value_idx] = value[src_value_idx];
+    } else {
+      // FP8 (E4M3) Quantization
+      key_cache[tgt_key_idx] = vllm::fp8::scaled_convert<cache_t, scalar_t>(key[src_key_idx], k_scale);
+      value_cache[tgt_value_idx] = vllm::fp8::scaled_convert<cache_t, scalar_t>(value[src_value_idx], v_scale);
+    }
   }
 }
 
-#define CALL_RESHAPE_AND_CACHE(T)                                     \
-  vllm::reshape_and_cache_kernel<T><<<grid, block, 0, stream>>>(      \
+#define CALL_RESHAPE_AND_CACHE(T, cache_T)                                     \
+  vllm::reshape_and_cache_kernel<T, cache_T><<<grid, block, 0, stream>>>(      \
     reinterpret_cast<T*>(key),                                        \
     reinterpret_cast<T*>(value),                                      \
-    reinterpret_cast<T*>(key_cache),                                  \
-    reinterpret_cast<T*>(value_cache),                                \
+    reinterpret_cast<cache_T*>(key_cache),                                  \
+    reinterpret_cast<cache_T*>(value_cache),                                \
+    k_scale, v_scale,                                                   \
     slot_mapping,                                                     \
     key_stride,                                                       \
     value_stride,                                                     \
@@ -81,11 +91,13 @@ __global__ void reshape_and_cache_flash_kernel(
                                          // head_size]
     cache_t* __restrict__ value_cache,   // [num_blocks, block_size, num_heads,
                                          // head_size]
+    const float k_scale, const float v_scale,
     const int64_t* __restrict__ slot_mapping,  // [num_tokens]
     const int64_t block_stride, const int64_t page_stride,
     const int64_t head_stride, const int64_t key_stride,
     const int64_t value_stride, const int num_heads, const int head_size,
     const int block_size) {
+  const bool is_quantized = !std::is_same<scalar_t, cache_t>::value;
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
   // NOTE: slot_idx can be -1 if the token is padded
@@ -105,8 +117,14 @@ __global__ void reshape_and_cache_flash_kernel(
                                       head_idx * head_stride + head_offset;
     scalar_t tgt_key = key[src_key_idx];
     scalar_t tgt_value = value[src_value_idx];
-    key_cache[tgt_key_value_idx] = tgt_key;
-    value_cache[tgt_key_value_idx] = tgt_value;
+    if constexpr (!is_quantized) {
+      key_cache[tgt_key_value_idx] = tgt_key;
+      value_cache[tgt_key_value_idx] = tgt_value;
+    } else {
+      // FP8 (E4M3) Quantization
+      key_cache[tgt_key_value_idx] = vllm::fp8::scaled_convert<cache_t, scalar_t>(tgt_key, k_scale);
+      value_cache[tgt_key_value_idx] = vllm::fp8::scaled_convert<cache_t, scalar_t>(tgt_value, v_scale);
+    }
   }
 }
 
@@ -120,6 +138,7 @@ __global__ void reshape_and_cache_flash_kernel(
           reinterpret_cast<KV_T*>(value),                      \
           reinterpret_cast<CACHE_T*>(key_cache),               \
           reinterpret_cast<CACHE_T*>(value_cache),             \
+          k_scale, v_scale,                                   \
           slot_mapping, block_stride, page_stride,    \
           head_stride, key_stride, value_stride, num_heads, head_size,    \
           block_size);
@@ -131,6 +150,8 @@ extern "C" void call_reshape_and_cache(
   void *value,            // [num_tokens, num_heads, head_size]
   void *key_cache,        // [num_blocks, num_heads, head_size/x, block_size, x]
   void *value_cache,      // [num_blocks, num_heads, head_size, block_size]
+  float k_scale,
+  float v_scale,
   int64_t* slot_mapping,  // [num_tokens]
 
   int32_t num_tokens,
@@ -147,13 +168,22 @@ extern "C" void call_reshape_and_cache(
   dim3 grid(num_tokens);
   dim3 block(std::min(num_heads * head_size, 512));
   const cudaStream_t stream = (cudaStream_t)stream_;
-
-  if (dtype == 0){
-    CALL_RESHAPE_AND_CACHE(uint16_t);
-  } else if (dtype == 1) {
-    CALL_RESHAPE_AND_CACHE(__nv_bfloat16);
-  } else if (dtype == 2) {
-    CALL_RESHAPE_AND_CACHE(float);
+  if (k_scale != 1.0f || v_scale != 1.0f) {
+    if (dtype == 0){
+      CALL_RESHAPE_AND_CACHE(uint16_t, uint8_t);
+    } else if (dtype == 1) {
+      CALL_RESHAPE_AND_CACHE(__nv_bfloat16, uint8_t);
+    } else if (dtype == 2) {
+      CALL_RESHAPE_AND_CACHE(float, uint8_t);
+    }
+  } else {
+    if (dtype == 0){
+      CALL_RESHAPE_AND_CACHE(uint16_t, uint16_t);
+    } else if (dtype == 1) {
+      CALL_RESHAPE_AND_CACHE(__nv_bfloat16, __nv_bfloat16);
+    } else if (dtype == 2) {
+      CALL_RESHAPE_AND_CACHE(float, float);
+    }
   }
 }
 
@@ -162,6 +192,8 @@ extern "C" void call_reshape_and_cache_flash(
   void *value,            // [num_tokens, num_heads, head_size]
   void *key_cache,        // [num_blocks, block_size, num_heads, head_size]
   void *value_cache,      // [num_blocks, block_size, num_heads, head_size]
+  float k_scale,
+  float v_scale,
   int64_t* slot_mapping,  // [num_tokens]
 
   int32_t num_tokens,
@@ -182,11 +214,21 @@ extern "C" void call_reshape_and_cache_flash(
   dim3 block(std::min(num_heads * head_size, 512));
   const cudaStream_t stream = (cudaStream_t)stream_;
 
-  if (dtype == 0){
-    CALL_RESHAPE_AND_CACHE_FLASH(uint16_t, uint16_t);
-  } else if (dtype == 1) {
-    CALL_RESHAPE_AND_CACHE_FLASH(__nv_bfloat16, __nv_bfloat16);
-  } else if (dtype == 2) {
-    CALL_RESHAPE_AND_CACHE_FLASH(float, float);
+  if (k_scale != 1.0f || v_scale != 1.0f) {
+    if (dtype == 0){
+      CALL_RESHAPE_AND_CACHE_FLASH(uint16_t, uint8_t);
+    } else if (dtype == 1) {
+      CALL_RESHAPE_AND_CACHE_FLASH(__nv_bfloat16, uint8_t);
+    } else if (dtype == 2) {
+      CALL_RESHAPE_AND_CACHE_FLASH(float, uint8_t);
+    }
+  } else {
+    if (dtype == 0){
+      CALL_RESHAPE_AND_CACHE_FLASH(uint16_t, uint16_t);
+    } else if (dtype == 1) {
+      CALL_RESHAPE_AND_CACHE_FLASH(__nv_bfloat16, __nv_bfloat16);
+    } else if (dtype == 2) {
+      CALL_RESHAPE_AND_CACHE_FLASH(float, float);
+    }
   }
 }

@@ -229,6 +229,8 @@ impl PagedAttention {
         value_cache: Option<Tensor>,
         input_metadata: &InputMetadata,
         softcapping: Option<f64>,
+        k_scale: Option<f32>,
+        v_scale: Option<f32>,
     ) -> Result<Tensor> {
         let dims = input_metadata.slot_mapping.dims();
         let slot_mapping = if dims.len() > 1 {
@@ -270,6 +272,8 @@ impl PagedAttention {
                 &value,
                 key_cache.as_ref().unwrap(),
                 value_cache.as_ref().unwrap(),
+                k_scale,
+                v_scale,
                 &slot_mapping,
             )?;
 
@@ -348,6 +352,8 @@ impl PagedAttention {
             &query,
             key_cache.as_ref().unwrap(),
             value_cache.as_ref().unwrap(),
+            k_scale,
+            v_scale,
             block_tables,
             context_lens,
             None,

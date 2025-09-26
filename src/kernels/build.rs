@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use std::process::Command;
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/pagedattention.cu");
+    println!("cargo:rerun-if-changed=src/pagedattention.cuh");
     println!("cargo:rerun-if-changed=src/prefill_paged_attn.cu");
     println!("cargo:rerun-if-changed=src/copy_blocks_kernel.cu");
     println!("cargo:rerun-if-changed=src/reshape_and_cache_kernel.cu");
     println!("cargo:rerun-if-changed=src/sort.cu");
+    let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
+    let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
     let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap_or("".to_string()));
     let mut builder = bindgen_cuda::Builder::default()
         .arg("--expt-relaxed-constexpr")
@@ -46,7 +48,16 @@ fn main() -> Result<()> {
     };
 
     if compute_cap < 800 {
+        builder = builder.arg("-DNO_BF16_KERNEL");
         builder = builder.arg("-DNO_MARLIN_KERNEL");
+    }
+
+    if marlin_disabled {
+        builder = builder.arg("-DNO_MARLIN_KERNEL");
+    }
+
+    if fp8_kvcache_disabled {
+        builder = builder.arg("-DNO_FP8_KVCACHE");
     }
 
     let mut is_target_msvc = false;
