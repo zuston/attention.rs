@@ -525,6 +525,8 @@ impl PagedAttention {
                 q_stride as i32,
                 kv_block_stride as i32,
                 kv_head_stride as i32,
+                self.k_scale.unwrap_or(1.0),
+                self.v_scale.unwrap_or(1.0),
             )
             .map_err(candle_core::Error::wrap)?;
         } else {
@@ -575,6 +577,8 @@ impl PagedAttention {
                 q_stride as i32,
                 kv_block_stride as i32,
                 kv_head_stride as i32,
+                self.k_scale.unwrap_or(1.0),
+                self.v_scale.unwrap_or(1.0),
             )
             .map_err(candle_core::Error::wrap)?;
         }
@@ -1021,6 +1025,8 @@ impl ReshapeCache {
             x as i32,
             key_stride,
             value_stride,
+            self.k_scale.unwrap_or(1.0),
+            self.v_scale.unwrap_or(1.0),
         )
         .map_err(candle_core::Error::wrap)?;
 

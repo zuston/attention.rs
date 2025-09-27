@@ -1,10 +1,10 @@
 use candle_core::{DType, MetalStorage};
 use metal::{
-    Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, Function,
+    Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device, Function,
     FunctionConstantValues, Library, MTLDataType, MTLSize, NSUInteger,
 };
 use once_cell::sync::OnceCell;
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 use std::{collections::HashMap, ffi::c_void};
 
 pub mod utils;
@@ -17,18 +17,10 @@ pub enum PagedAttentionDType {
     F32 = 2,
 }
 
-const COPY_BLOCKS: &str = include_str!("copy_blocks.metal");
-const RESHAPE_AND_CACHE: &str = include_str!("reshape_and_cache.metal");
-const PAGEDATTENTION: &str = include_str!("pagedattention.metal");
-const PREFILL_PAGEDATTENTION: &str = include_str!("prefill_paged_attn.metal");
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Source {
-    CopyBlocks,
-    ReshapeAndCache,
-    PagedAttention,
-    PrefillPagedAttention,
-}
+#[cfg(target_os = "macos")]
+const KERNELS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/paged_attention.metallib"));
+#[cfg(target_os = "ios")]
+const KERNELS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/paged_attention_ios.metallib"));
 
 #[derive(thiserror::Error, Debug)]
 pub enum MetalKernelError {
@@ -50,16 +42,15 @@ impl<T> From<std::sync::PoisonError<T>> for MetalKernelError {
     }
 }
 
-type Libraries = HashMap<Source, Library>;
 type Pipelines = HashMap<(String, Option<ConstantValues>), ComputePipelineState>;
 
 #[derive(Debug)]
 pub struct Kernels {
-    libraries: RwLock<Libraries>,
     pipelines: RwLock<Pipelines>,
 }
 
 pub(crate) static G_KERNEL: OnceCell<Kernels> = OnceCell::new();
+pub(crate) static LIBRARY: OnceLock<Library> = OnceLock::new();
 
 impl Kernels {
     pub fn default() -> &'static Kernels {
@@ -67,54 +58,34 @@ impl Kernels {
     }
 
     pub fn new() -> Self {
-        let libraries = RwLock::new(Libraries::new());
         let pipelines = RwLock::new(Pipelines::new());
-        Self {
-            libraries,
-            pipelines,
-        }
+        Self { pipelines }
     }
 
-    fn get_library_source(&self, source: Source) -> &'static str {
-        match source {
-            Source::CopyBlocks => COPY_BLOCKS,
-            Source::ReshapeAndCache => RESHAPE_AND_CACHE,
-            Source::PagedAttention => PAGEDATTENTION,
-            Source::PrefillPagedAttention => PREFILL_PAGEDATTENTION,
-        }
-    }
-
-    /// Load the give library from its [`source`].
-    /// If this has been previously loaded it will just fetch it from cache.
-    pub fn load_library(
-        &self,
-        device: &Device,
-        source: Source,
-    ) -> Result<Library, MetalKernelError> {
-        let mut libraries = self.libraries.write()?;
-        if let Some(lib) = libraries.get(&source) {
+    pub fn load_library(&self, device: &Device) -> Result<Library, MetalKernelError> {
+        if let Some(lib) = LIBRARY.get() {
             Ok(lib.clone())
         } else {
+            let source_data = KERNELS;
             let lib = {
-                let source_content = self.get_library_source(source);
-                device
-                    .new_library_with_source(source_content, &CompileOptions::new())
-                    .map_err(|e| MetalKernelError::LoadLibraryError(e.to_string()))?
+                device.new_library_with_data(source_data).map_err(|e| {
+                    MetalKernelError::LoadLibraryError(format!(
+                        "Metal requires macosx > 13.0 or higher, cannot load candle metal library: {e}"
+                    ))
+                })?
             };
-            libraries.insert(source, lib.clone());
-            Ok(lib)
+            Ok(LIBRARY.get_or_init(|| lib).clone())
         }
     }
 
     fn load_function(
         &self,
         device: &Device,
-        source: Source,
         name: String,
         constants: Option<FunctionConstantValues>,
     ) -> Result<Function, MetalKernelError> {
         let func = self
-            .load_library(device, source)?
+            .load_library(device)?
             .get_function(&name, constants)
             .map_err(|e| MetalKernelError::LoadFunctionError(e.to_string()))?;
         Ok(func)
@@ -126,7 +97,6 @@ impl Kernels {
     fn load_pipeline_with_constants(
         &self,
         device: &Device,
-        source: Source,
         name: String,
         constants: Option<ConstantValues>,
     ) -> Result<ComputePipelineState, MetalKernelError> {
@@ -138,7 +108,6 @@ impl Kernels {
             let (name, constants) = key;
             let func = self.load_function(
                 device,
-                source,
                 name.clone(),
                 constants.as_ref().map(|c| c.function_constant_values()),
             )?;
@@ -157,10 +126,9 @@ impl Kernels {
     pub fn load_pipeline(
         &self,
         device: &Device,
-        source: Source,
         name: String,
     ) -> Result<ComputePipelineState, MetalKernelError> {
-        self.load_pipeline_with_constants(device, source, name, None)
+        self.load_pipeline_with_constants(device, name, None)
     }
 }
 
@@ -190,7 +158,7 @@ pub fn call_copy_blocks(
             })
         }
     };
-    let pipeline = kernels.load_pipeline(device, Source::CopyBlocks, name.to_string())?;
+    let pipeline = kernels.load_pipeline(device, name.to_string())?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -242,13 +210,34 @@ pub fn call_reshape_and_cache(
     x: i32,
     key_stride: i32,
     value_stride: i32,
+    k_scale: f32,
+    v_scale: f32,
 ) -> Result<(), MetalKernelError> {
+    let quantized_cache = k_scale != 1.0f32 && v_scale != 1.0f32;
     let name = match ty {
-        PagedAttentionDType::F32 => "reshape_and_cache_float",
-        PagedAttentionDType::BF16 => "reshape_and_cache_bfloat16_t",
-        PagedAttentionDType::F16 => "reshape_and_cache_half",
+        PagedAttentionDType::F32 => {
+            if quantized_cache {
+                "reshape_and_cache_float_uint8_t"
+            } else {
+                "reshape_and_cache_float_float"
+            }
+        }
+        PagedAttentionDType::BF16 => {
+            if quantized_cache {
+                "reshape_and_cache_bfloat16_t_uint8_t"
+            } else {
+                "reshape_and_cache_bfloat16_t_bfloat16_t"
+            }
+        }
+        PagedAttentionDType::F16 => {
+            if quantized_cache {
+                "reshape_and_cache_half_uint8_t"
+            } else {
+                "reshape_and_cache_half_half"
+            }
+        }
     };
-    let pipeline = kernels.load_pipeline(device, Source::ReshapeAndCache, name.to_string())?;
+    let pipeline = kernels.load_pipeline(device, name.to_string())?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -266,7 +255,9 @@ pub fn call_reshape_and_cache(
             num_heads,
             head_size,
             block_size,
-            x
+            x,
+            k_scale,
+            v_scale
         )
     );
 
@@ -364,14 +355,35 @@ pub fn paged_attention_v1(
     q_stride: i32,
     kv_block_stride: i32,
     kv_head_stride: i32,
+    k_scale: f32,
+    v_scale: f32,
 ) -> Result<(), MetalKernelError> {
     const NUM_THREADS: u64 = 256;
     const NUM_SIMD_LANES: u64 = 32;
+    let quantized_cache = k_scale != 1.0f32 && v_scale != 1.0f32;
 
     let name = match ty {
-        PagedAttentionDType::F32 => "paged_attention_float",
-        PagedAttentionDType::BF16 => "paged_attention_bfloat16_t",
-        PagedAttentionDType::F16 => "paged_attention_half",
+        PagedAttentionDType::F32 => {
+            if quantized_cache {
+                "paged_attention_float_uint8_t"
+            } else {
+                "paged_attention_float_float"
+            }
+        }
+        PagedAttentionDType::BF16 => {
+            if quantized_cache {
+                "paged_attention_bfloat16_t_uint8_t"
+            } else {
+                "paged_attention_bfloat16_t_bfloat16_t"
+            }
+        }
+        PagedAttentionDType::F16 => {
+            if quantized_cache {
+                "paged_attention_half_uint8_t"
+            } else {
+                "paged_attention_half_half"
+            }
+        }
     };
     let mut name = name.to_string();
     name.push_str(&format!("_hs{head_size}"));
@@ -391,8 +403,7 @@ pub fn paged_attention_v1(
         ),
     ]));
 
-    let pipeline =
-        kernels.load_pipeline_with_constants(device, Source::PagedAttention, name, constants)?;
+    let pipeline = kernels.load_pipeline_with_constants(device, name, constants)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -451,6 +462,17 @@ pub fn paged_attention_v1(
         &kv_head_stride as *const _ as *const c_void,
     );
 
+    encoder.set_bytes(
+        16,
+        core::mem::size_of_val(&k_scale) as u64,
+        &k_scale as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        17,
+        core::mem::size_of_val(&v_scale) as u64,
+        &v_scale as *const _ as *const c_void,
+    );
+
     let thread_groups_count = MTLSize {
         width: num_heads as u64,
         height: num_seqs as u64,
@@ -498,17 +520,37 @@ pub fn paged_attention_v2(
     q_stride: i32,
     kv_block_stride: i32,
     kv_head_stride: i32,
+    k_scale: f32,
+    v_scale: f32,
 ) -> Result<(), MetalKernelError> {
     const NUM_THREADS: u64 = 256;
     const PARTITION_SIZE: u64 = 512;
     const NUM_SIMD_LANES: u64 = 32;
-
+    let quantized_cache = k_scale != 1.0f32 && v_scale != 1.0f32;
     // Initial paged attention kernel
     {
         let name = match ty {
-            PagedAttentionDType::F32 => "paged_attention_float",
-            PagedAttentionDType::BF16 => "paged_attention_bfloat16_t",
-            PagedAttentionDType::F16 => "paged_attention_half",
+            PagedAttentionDType::F32 => {
+                if quantized_cache {
+                    "paged_attention_float_uint8_t"
+                } else {
+                    "paged_attention_float_float"
+                }
+            }
+            PagedAttentionDType::BF16 => {
+                if quantized_cache {
+                    "paged_attention_bfloat16_t_uint8_t"
+                } else {
+                    "paged_attention_bfloat16_t_bfloat16_t"
+                }
+            }
+            PagedAttentionDType::F16 => {
+                if quantized_cache {
+                    "paged_attention_half_uint8_t"
+                } else {
+                    "paged_attention_half_half"
+                }
+            }
         };
         let mut name = name.to_string();
         name.push_str(&format!("_hs{head_size}"));
@@ -528,12 +570,7 @@ pub fn paged_attention_v2(
             ),
         ]));
 
-        let pipeline = kernels.load_pipeline_with_constants(
-            device,
-            Source::PagedAttention,
-            name,
-            constants,
-        )?;
+        let pipeline = kernels.load_pipeline_with_constants(device, name, constants)?;
 
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
@@ -596,6 +633,17 @@ pub fn paged_attention_v2(
             &kv_head_stride as *const _ as *const c_void,
         );
 
+        encoder.set_bytes(
+            16,
+            core::mem::size_of_val(&k_scale) as u64,
+            &k_scale as *const _ as *const c_void,
+        );
+        encoder.set_bytes(
+            17,
+            core::mem::size_of_val(&v_scale) as u64,
+            &v_scale as *const _ as *const c_void,
+        );
+
         let thread_groups_count = MTLSize {
             width: num_heads as u64,
             height: num_seqs as u64,
@@ -612,9 +660,27 @@ pub fn paged_attention_v2(
     // Paged attention reduce kernel
     {
         let name = match ty {
-            PagedAttentionDType::F32 => "paged_attention_v2_reduce_float",
-            PagedAttentionDType::BF16 => "paged_attention_v2_reduce_bfloat16_t",
-            PagedAttentionDType::F16 => "paged_attention_v2_reduce_half",
+            PagedAttentionDType::F32 => {
+                if quantized_cache {
+                    "paged_attention_v2_reduce_float_uint8_t"
+                } else {
+                    "paged_attention_v2_reduce_float_float"
+                }
+            }
+            PagedAttentionDType::BF16 => {
+                if quantized_cache {
+                    "paged_attention_v2_reduce_bfloat16_t_uint8_t"
+                } else {
+                    "paged_attention_v2_reduce_bfloat16_t_bfloat16_t"
+                }
+            }
+            PagedAttentionDType::F16 => {
+                if quantized_cache {
+                    "paged_attention_v2_reduce_half_uint8_t"
+                } else {
+                    "paged_attention_v2_reduce_half_half"
+                }
+            }
         };
         let mut name = name.to_string();
         name.push_str(&format!("_hs{head_size}"));
@@ -622,7 +688,7 @@ pub fn paged_attention_v2(
         name.push_str(&format!("_nsl{}", NUM_SIMD_LANES));
         name.push_str(&format!("_ps{}", PARTITION_SIZE));
 
-        let pipeline = kernels.load_pipeline(device, Source::PagedAttention, name)?;
+        let pipeline = kernels.load_pipeline(device, name)?;
 
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
@@ -756,7 +822,7 @@ pub fn paged_attention_prefill(
     );
 
     // 2. Load the pipeline. The prefill kernel does not use function constants.
-    let pipeline = kernels.load_pipeline(device, Source::PrefillPagedAttention, name)?;
+    let pipeline = kernels.load_pipeline(device, name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);

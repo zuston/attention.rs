@@ -1,909 +1,12 @@
 // Updated from MLX commit has f70764a
-
+#include "metal_dtype.metal"
 #include <metal_stdlib>
 #include <metal_simdgroup>
-
 using namespace metal;
 
-#if defined(__HAVE_BFLOAT__)
-
-typedef bfloat bfloat16_t;
-
-#else
-
-/////////////////////////////////////////////////////////////////////////////
-// Helpers
-/////////////////////////////////////////////////////////////////////////////
-
-constexpr METAL_FUNC uint16_t float_to_bfloat_bits(float x) {
-  // Check for nan
-  if ((as_type<uint32_t>(x) & ~_fp_encoding_traits<float>::sign_mask) >
-      _fp_encoding_traits<float>::inf_mask) {
-    return uint16_t(as_type<uint32_t>(0x7FC0));
-  }
-  // Take bits
-  uint32_t float_bits = as_type<uint32_t>(x);
-
-  // Round to nearest even
-  float_bits += ((float_bits >> 16) & 1) + as_type<uint32_t>(0x7FFF);
-
-  // Take upper 16 bits
-  return float_bits >> 16;
-}
-
-constexpr METAL_FUNC float bfloat_bits_to_float(uint16_t x) {
-  // Upper 16 bits are the data and lower 16 bits are 0s
-  return as_type<float>((uint32_t)x << 16);
-}
-
-struct _MLX_BFloat16;
-
-template <typename T>
-static constexpr constant bool can_convert_to_bfloat =
-    !is_same_v<T, _MLX_BFloat16> && is_convertible_v<T, float>;
-
-template <typename T>
-static constexpr constant bool can_convert_from_bfloat =
-    !is_same_v<T, _MLX_BFloat16> && is_convertible_v<float, T>;
-
-/////////////////////////////////////////////////////////////////////////////
-// Bfloat struct
-/////////////////////////////////////////////////////////////////////////////
-
-struct _MLX_BFloat16 {
-  /////////////////////////////////////////////////////////////////////////////
-  // Constructors
-  uint16_t bits_;
-  _MLX_BFloat16() thread = default;
-  _MLX_BFloat16() threadgroup = default;
-  _MLX_BFloat16() device = default;
-  _MLX_BFloat16() constant = default;
-
-  struct bits_to_bfloat_struct {};
-  static constexpr METAL_FUNC bits_to_bfloat_struct bits_to_bfloat() {
-    return bits_to_bfloat_struct();
-  }
-  constexpr METAL_FUNC _MLX_BFloat16(uint16_t bits, bits_to_bfloat_struct)
-      : bits_(bits) {}
-
-  /////////////////////////////////////////////////////////////////////////////
-  // Conversions to bfloat
-
-  template <
-      typename T,
-      typename = typename enable_if<can_convert_to_bfloat<T>>::type>
-  constexpr METAL_FUNC _MLX_BFloat16(T x) thread
-      : bits_(float_to_bfloat_bits(static_cast<float>(x))) {}
-
-  template <
-      typename T,
-      typename = typename enable_if<can_convert_to_bfloat<T>>::type>
-  constexpr METAL_FUNC _MLX_BFloat16(T x) threadgroup
-      : bits_(float_to_bfloat_bits(static_cast<float>(x))) {}
-
-  template <
-      typename T,
-      typename = typename enable_if<can_convert_to_bfloat<T>>::type>
-  constexpr METAL_FUNC _MLX_BFloat16(T x) device
-      : bits_(float_to_bfloat_bits(static_cast<float>(x))) {}
-
-  template <
-      typename T,
-      typename = typename enable_if<can_convert_to_bfloat<T>>::type>
-  constexpr METAL_FUNC _MLX_BFloat16(T x) constant
-      : bits_(float_to_bfloat_bits(static_cast<float>(x))) {}
-
-  /////////////////////////////////////////////////////////////////////////////
-  // Conversions from bfloat
-
-  template <
-      typename T,
-      typename = typename enable_if<can_convert_from_bfloat<T>>::type>
-  constexpr METAL_FUNC operator T() const thread {
-    return static_cast<T>(bfloat_bits_to_float(bits_));
-  }
-
-  template <
-      typename T,
-      typename = typename enable_if<can_convert_from_bfloat<T>>::type>
-  constexpr METAL_FUNC operator T() const threadgroup {
-    return static_cast<T>(bfloat_bits_to_float(bits_));
-  }
-
-  template <
-      typename T,
-      typename = typename enable_if<can_convert_from_bfloat<T>>::type>
-  constexpr METAL_FUNC operator T() const device {
-    return static_cast<T>(bfloat_bits_to_float(bits_));
-  }
-
-  template <
-      typename T,
-      typename = typename enable_if<can_convert_from_bfloat<T>>::type>
-  constexpr METAL_FUNC operator T() const constant {
-    return static_cast<T>(bfloat_bits_to_float(bits_));
-  }
-};
-
-/////////////////////////////////////////////////////////////////////////////
-// Bfloat operators
-/////////////////////////////////////////////////////////////////////////////
-
-/////////////////////////////////////////////////////////////////////////////
-// Unary ops
-constexpr METAL_FUNC _MLX_BFloat16 operator-(_MLX_BFloat16 x) {
-  return -static_cast<float>(x);
-}
-
-/////////////////////////////////////////////////////////////////////////////
-// Binary operators
-#define bfloat_binop_base(__op__, __operator__, otype, atype, btype, ctype) \
-  constexpr METAL_FUNC otype __operator__(atype lhs, btype rhs) {           \
-    return static_cast<ctype>(lhs) __op__ static_cast<ctype>(rhs);          \
-  }
-
-#define bfloat_binop_helper(__op__, __operator__, otype, itype, ctype)    \
-  constexpr METAL_FUNC otype __operator__(_MLX_BFloat16 lhs, itype rhs) { \
-    return static_cast<ctype>(lhs) __op__ static_cast<ctype>(rhs);        \
-  }                                                                       \
-  constexpr METAL_FUNC otype __operator__(itype lhs, _MLX_BFloat16 rhs) { \
-    return static_cast<ctype>(lhs) __op__ static_cast<ctype>(rhs);        \
-  }
-
-/////////////////////////////////////////////////////////////////////////////
-// Arithmetic Operators
-#define bfloat_binop(_op_, _operator_)                                       \
-  bfloat_binop_base(                                                         \
-      _op_, _operator_, _MLX_BFloat16, _MLX_BFloat16, _MLX_BFloat16, float); \
-  bfloat_binop_helper(_op_, _operator_, float, float, float);                \
-  bfloat_binop_helper(_op_, _operator_, float, half, float);                 \
-  bfloat_binop_helper(_op_, _operator_, _MLX_BFloat16, int32_t, float);      \
-  bfloat_binop_helper(_op_, _operator_, _MLX_BFloat16, uint32_t, float);     \
-  bfloat_binop_helper(_op_, _operator_, _MLX_BFloat16, int64_t, float);      \
-  bfloat_binop_helper(_op_, _operator_, _MLX_BFloat16, uint64_t, float);
-
-bfloat_binop(+, operator+);
-bfloat_binop(-, operator-);
-bfloat_binop(*, operator*);
-bfloat_binop(/, operator/);
-
-/////////////////////////////////////////////////////////////////////////////
-// Comparison ops
-#define bfloat_compop(__op__, __operator__)                             \
-  bfloat_binop_base(                                                    \
-      __op__, __operator__, bool, _MLX_BFloat16, _MLX_BFloat16, float); \
-  bfloat_binop_helper(__op__, __operator__, bool, float, float);        \
-  bfloat_binop_helper(__op__, __operator__, bool, half, float);         \
-  bfloat_binop_helper(__op__, __operator__, bool, int32_t, float);      \
-  bfloat_binop_helper(__op__, __operator__, bool, uint32_t, float);     \
-  bfloat_binop_helper(__op__, __operator__, bool, int64_t, float);      \
-  bfloat_binop_helper(__op__, __operator__, bool, uint64_t, float);
-
-bfloat_compop(>, operator>);
-bfloat_compop(<, operator<);
-bfloat_compop(>=, operator>=);
-bfloat_compop(<=, operator<=);
-bfloat_compop(==, operator==);
-bfloat_compop(!=, operator!=);
-
-#undef bfloat_compop
-#undef bfloat_binop_base
-#undef bfloat_binop_helper
-#undef bfloat_binop
-
-/////////////////////////////////////////////////////////////////////////////
-// Inplace Operators
-#define bfloat_inplace_op_helper(__op__, __operator__, itype, addr_space) \
-  constexpr METAL_FUNC addr_space _MLX_BFloat16& __operator__(            \
-      addr_space _MLX_BFloat16& lhs, itype rhs) {                         \
-    lhs = static_cast<float>(lhs) __op__ static_cast<float>(rhs);         \
-    return lhs;                                                           \
-  }                                                                       \
-  constexpr METAL_FUNC addr_space itype& __operator__(                    \
-      addr_space itype& lhs, _MLX_BFloat16 rhs) {                         \
-    lhs = static_cast<float>(lhs) __op__ static_cast<float>(rhs);         \
-    return lhs;                                                           \
-  }
-
-#define bfloat_inplace_op_addr_space_helper(__op__, __operator__, itype) \
-  bfloat_inplace_op_helper(__op__, __operator__, itype, device);         \
-  bfloat_inplace_op_helper(__op__, __operator__, itype, thread);         \
-  bfloat_inplace_op_helper(__op__, __operator__, itype, threadgroup);
-
-#define bfloat_inplace_op(itype)                             \
-  bfloat_inplace_op_addr_space_helper(+, operator+=, itype); \
-  bfloat_inplace_op_addr_space_helper(-, operator-=, itype); \
-  bfloat_inplace_op_addr_space_helper(*, operator*=, itype); \
-  bfloat_inplace_op_addr_space_helper(/, operator/=, itype);
-
-bfloat_inplace_op(float);
-bfloat_inplace_op(half);
-bfloat_inplace_op(int16_t);
-bfloat_inplace_op(int32_t);
-bfloat_inplace_op(int64_t);
-bfloat_inplace_op(uint16_t);
-bfloat_inplace_op(uint32_t);
-bfloat_inplace_op(uint64_t);
-
-#undef bfloat_inplace_op_helper
-#undef bfloat_inplace_op_addr_space_helper
-#undef bfloat_inplace_op
-
-#define bfloat_inplace_op_helper(__op__, __operator__, addr_space) \
-  constexpr METAL_FUNC addr_space _MLX_BFloat16& __operator__(     \
-      addr_space _MLX_BFloat16& lhs, _MLX_BFloat16 rhs) {          \
-    lhs = static_cast<float>(lhs) __op__ static_cast<float>(rhs);  \
-    return lhs;                                                    \
-  }
-
-#define bfloat_inplace_op_addr_space_helper(__op__, __operator__) \
-  bfloat_inplace_op_helper(__op__, __operator__, device);         \
-  bfloat_inplace_op_helper(__op__, __operator__, thread);         \
-  bfloat_inplace_op_helper(__op__, __operator__, threadgroup);
-
-bfloat_inplace_op_addr_space_helper(+, operator+=);
-bfloat_inplace_op_addr_space_helper(-, operator-=);
-bfloat_inplace_op_addr_space_helper(*, operator*=);
-bfloat_inplace_op_addr_space_helper(/, operator/=);
-
-#undef bfloat_inplace_op_helper
-#undef bfloat_inplace_op_addr_space_helper
-
-/////////////////////////////////////////////////////////////////////////////
-// Bfloat typedef
-/////////////////////////////////////////////////////////////////////////////
-
-typedef struct _MLX_BFloat16 bfloat16_t;
-
-#endif
-
-// ========================================== Generic vector types
-
-// A vector type to store Q, K, V elements.
-template<typename T, int VEC_SIZE>
-struct Vec {};
-
-// A vector type to store FP32 accumulators.
-template<typename T>
-struct FloatVec {};
-
-// Template vector operations.
-template<typename Acc, typename A, typename B>
-inline Acc mul(A a, B b);
-
-template<typename T>
-inline float sum(T v);
-
-template<typename T>
-inline float dot(T a, T b) {
-  return sum(mul<T, T, T>(a, b));
-}
-
-template<typename A, typename T>
-inline float dot(T a, T b) {
-  return sum(mul<A, T, T>(a, b));
-}
-
-
-
-// FP32 vector data types.
-struct Float8_ {
-  float4 x;
-  float4 y;
-};
-
-template<>
-struct Vec<float, 1> {
-  using Type = float;
-};
-template<>
-struct Vec<float, 2> {
-  using Type = float2;
-};
-template<>
-struct Vec<float, 4> {
-  using Type = float4;
-};
-template<>
-struct Vec<float, 8> {
-  using Type = Float8_;
-};
-
-template<>
-struct FloatVec<float> {
-  using Type = float;
-};
-template<>
-struct FloatVec<float2> {
-  using Type = float2;
-};
-template<>
-struct FloatVec<float4> {
-  using Type = float4;
-};
-template<>
-struct FloatVec<Float8_> {
-  using Type = Float8_;
-};
-
-template<>
-inline float mul(float a, float b) {
-  return a*b;
-}
-
-template<>
-inline float2 mul(float2 a, float2 b) {
-  return a*b;
-}
-
-template<>
-inline float4 mul(float4 a, float4 b) {
-  return a*b;
-}
-
-template<>
-inline Float8_ mul(Float8_ a, Float8_ b) {
-  Float8_ c;
-  c.x = a.x * b.x;
-  c.y = a.y * b.y;
-  return c;
-}
-
-template<>
-inline float sum(float a) {
-  return a;
-}
-
-template<>
-inline float sum(float2 a) {
-  return a.x + a.y;
-}
-
-template<>
-inline float sum(float4 a) {
-  return a.x + a.y + a.z + a.w;
-}
-
-template<>
-inline float sum(Float8_ a) {
-  return sum(a.x) + sum(a.y);
-}
-
-inline Float8_ fma(Float8_ a, Float8_ b, Float8_ c) {
-  Float8_ res;
-  res.x = fma(a.x, b.x, c.x);
-  res.y = fma(a.y, b.y, c.y);
-  return res;
-}
-
-inline void from_float(thread float& dst, float src) {
-  dst = src;
-}
-inline void from_float(thread float2& dst, float2 src) {
-  dst = src;
-}
-inline void from_float(thread float4& dst, float4 src) {
-  dst = src;
-}
-inline void from_float(thread Float8_& dst, Float8_ src) {
-  dst = src;
-}
-
-
-
-
-// BF16 vector data types.
-// #if defined(__HAVE_BFLOAT__)
-
-// struct Bfloat8_ {
-//   bfloat4 x;
-//   bfloat4 y;
-// };
-
-// template<>
-// struct Vec<bfloat, 1> {
-//   using Type = bfloat;
-// };
-// template<>
-// struct Vec<bfloat, 2> {
-//   using Type = bfloat2;
-// };
-// template<>
-// struct Vec<bfloat, 4> {
-//   using Type = bfloat4;
-// };
-// template<>
-// struct Vec<bfloat, 8> {
-//   using Type = Bfloat8_;
-// };
-
-// template<>
-// struct FloatVec<bfloat> {
-//   using Type = float;
-// };
-// template<>
-// struct FloatVec<bfloat2> {
-//   using Type = float2;
-// };
-// template<>
-// struct FloatVec<bfloat4> {
-//   using Type = float4;
-// };
-// template<>
-// struct FloatVec<Bfloat8_> {
-//   using Type = Float8_;
-// };
-
-// template<>
-// inline float mul(bfloat a, bfloat b) {
-//   return (float)a * (float)b;
-// }
-// template<>
-// inline bfloat mul(bfloat a, bfloat b) {
-//   return a*b;
-// }
-
-// template<>
-// inline float2 mul(bfloat2 a, bfloat2 b) {
-//   return (float2)a * (float2)b;
-// }
-// template<>
-// inline bfloat2 mul(bfloat2 a, bfloat2 b) {
-//   return a * b;
-// }
-
-// template<>
-// inline float4 mul(bfloat4 a, bfloat4 b) {
-//   return (float4)a * (float4)b;
-// }
-// template<>
-// inline bfloat4 mul(bfloat4 a, bfloat4 b) {
-//   return a * b;
-// }
-
-// template<>
-// inline Float8_ mul(Bfloat8_ a, Bfloat8_ b) {
-//   Float8_ c;
-//   c.x = mul<float4, bfloat4, bfloat4>(a.x, b.x);
-//   c.y = mul<float4, bfloat4, bfloat4>(a.y, b.y);
-//   return c;
-// }
-// template<>
-// inline Bfloat8_ mul(Bfloat8_ a, Bfloat8_ b) {
-//   Bfloat8_ c;
-//   c.x = mul<bfloat4, bfloat4, bfloat4>(a.x, b.x);
-//   c.y = mul<bfloat4, bfloat4, bfloat4>(a.y, b.y);
-//   return c;
-// }
-
-// template<>
-// inline float sum(bfloat a) {
-//   return (float)a;
-// }
-
-// template<>
-// inline float sum(bfloat2 a) {
-//   return (float)a.x + (float)a.y;
-// }
-
-// template<>
-// inline float sum(bfloat4 a) {
-//   return sum(a.x) + sum(a.y);
-// }
-
-// template<>
-// inline float sum(Bfloat8_ a) {
-//   return sum(a.x) + sum(a.y);
-// }
-
-// inline float fma(bfloat a, bfloat b, float c) {
-//   return (float)a * (float)b + c;
-// }
-
-// inline float2 fma(bfloat2 a, bfloat2 b, float2 c) {
-//   return (float2)a * (float2)b + c;
-// }
-
-// inline float4 fma(bfloat4 a, bfloat4 b, float4 c) {
-//   return (float4)a * (float4)b + c;
-// }
-
-// inline Float8_ fma(Bfloat8_ a, Bfloat8_ b, Float8_ c) {
-//   Float8_ res;
-//   res.x = fma((float4)a.x, (float4)b.x, (float4)c.x);
-//   res.y = fma((float4)a.y, (float4)b.y, (float4)c.y);
-//   return res;
-// }
-// inline Bfloat8_ fma(Bfloat8_ a, Bfloat8_ b, Bfloat8_ c) {
-//   Bfloat8_ res;
-//   res.x = (bfloat4)fma((float4)a.x, (float4)b.x, (float4)c.x);
-//   res.y = (bfloat4)fma((float4)a.y, (float4)b.x, (float4)c.y);
-//   return c;
-// }
-
-// inline void from_float(thread bfloat& dst, float src) {
-//   dst = static_cast<bfloat>(src);
-// }
-// inline void from_float(thread bfloat2& dst, float2 src) {
-//   dst.x = static_cast<bfloat>(src.x);
-//   dst.y = static_cast<bfloat>(src.y);
-// }
-// inline void from_float(thread bfloat4& dst, float4 src) {
-//   dst.x = static_cast<bfloat>(src.x);
-//   dst.y = static_cast<bfloat>(src.y);
-//   dst.z = static_cast<bfloat>(src.z);
-//   dst.w = static_cast<bfloat>(src.w);
-// }
-// inline void from_float(thread Bfloat8_& dst, Float8_ src) {
-//   bfloat4 x;
-//   bfloat4 y;
-//   from_float(x, src.x);
-//   from_float(y, src.y);
-//   dst.x = x;
-//   dst.y = y;
-// }
-
-// #else
-
-struct Bfloat2_ {
-  bfloat16_t x;
-  bfloat16_t y;
-};
-
-struct Bfloat4_ {
-  Bfloat2_ x;
-  Bfloat2_ y;
-};
-
-struct Bfloat8_ {
-  Bfloat4_ x;
-  Bfloat4_ y;
-};
-
-template<>
-struct Vec<bfloat16_t, 1> {
-  using Type = bfloat16_t;
-};
-template<>
-struct Vec<bfloat16_t, 2> {
-  using Type = Bfloat2_;
-};
-template<>
-struct Vec<bfloat16_t, 4> {
-  using Type = Bfloat4_;
-};
-template<>
-struct Vec<bfloat16_t, 8> {
-  using Type = Bfloat8_;
-};
-
-template<>
-struct FloatVec<bfloat16_t> {
-  using Type = float;
-};
-template<>
-struct FloatVec<Bfloat2_> {
-  using Type = float2;
-};
-template<>
-struct FloatVec<Bfloat4_> {
-  using Type = float4;
-};
-template<>
-struct FloatVec<Bfloat8_> {
-  using Type = Float8_;
-};
-
-template<>
-inline float mul(bfloat16_t a, bfloat16_t b) {
-  return (float)a * (float)b;
-}
-template<>
-inline bfloat16_t mul(bfloat16_t a, bfloat16_t b) {
-  return a*b;
-}
-
-template<>
-inline float2 mul(Bfloat2_ a, Bfloat2_ b) {
-  float2 a_f((float)a.x, (float)a.y);
-  float2 b_f((float)b.x, (float)b.y);
-  return a_f * b_f;
-}
-template<>
-inline Bfloat2_ mul(Bfloat2_ a, Bfloat2_ b) {
-  Bfloat2_ c;
-  c.x = a.x * b.x;
-  c.y = a.y * b.y;
-  return c;
-}
-
-template<>
-inline float4 mul(Bfloat4_ a, Bfloat4_ b) {
-  float2 x = mul<float2, Bfloat2_, Bfloat2_>(a.x, b.x);
-  float2 y = mul<float2, Bfloat2_, Bfloat2_>(a.y, b.y);
-  float4 c;
-  c.x = x.x;
-  c.y = x.y;
-  c.z = y.x;
-  c.w = y.y;
-  return c;
-}
-template<>
-inline Bfloat4_ mul(Bfloat4_ a, Bfloat4_ b) {
-  Bfloat4_ c;
-  c.x = mul<Bfloat2_, Bfloat2_, Bfloat2_>(a.x, b.x);
-  c.y = mul<Bfloat2_, Bfloat2_, Bfloat2_>(a.y, b.y);
-  return c;
-}
-
-template<>
-inline Float8_ mul(Bfloat8_ a, Bfloat8_ b) {
-  Float8_ c;
-  c.x = mul<float4, Bfloat4_, Bfloat4_>(a.x, b.x);
-  c.y = mul<float4, Bfloat4_, Bfloat4_>(a.y, b.y);
-  return c;
-}
-template<>
-inline Bfloat8_ mul(Bfloat8_ a, Bfloat8_ b) {
-  Bfloat8_ c;
-  c.x = mul<Bfloat4_, Bfloat4_, Bfloat4_>(a.x, b.x);
-  c.y = mul<Bfloat4_, Bfloat4_, Bfloat4_>(a.y, b.y);
-  return c;
-}
-
-template<>
-inline float sum(bfloat16_t a) {
-  return (float)a;
-}
-
-template<>
-inline float sum(Bfloat2_ a) {
-  return (float)a.x + (float)a.y;
-}
-
-template<>
-inline float sum(Bfloat4_ a) {
-  return sum(a.x) + sum(a.y);
-}
-
-template<>
-inline float sum(Bfloat8_ a) {
-  return sum(a.x) + sum(a.y);
-}
-
-inline float fma(bfloat16_t a, bfloat16_t b, float c) {
-  return (float)a * (float)b + c;
-}
-inline bfloat16_t fma(bfloat16_t a, bfloat16_t b, bfloat16_t c) {
-  return a*b+c;
-}
-
-inline float2 fma(Bfloat2_ a, Bfloat2_ b, float2 c) {
-  float2 a_f((float)a.x, (float)a.y);
-  float2 b_f((float)b.x, (float)b.y);
-  return a_f * b_f + c;
-}
-inline Bfloat2_ fma(Bfloat2_ a, Bfloat2_ b, Bfloat2_ c) {
-  Bfloat2_ res;
-  res.x = a.x * b.x + c.x;
-  res.y = a.y * b.y + c.y;
-  return res;
-}
-
-inline float4 fma(Bfloat4_ a, Bfloat4_ b, float4 c) {
-  float4 res;
-  res.x = fma(a.x.x, b.x.x, c.x);
-  res.y = fma(a.x.y, b.x.y, c.y);
-  res.z = fma(a.y.x, b.y.x, c.z);
-  res.w = fma(a.y.y, b.y.y, c.w);
-  return res;
-}
-inline Bfloat4_ fma(Bfloat4_ a, Bfloat4_ b, Bfloat4_ c) {
-  Bfloat4_ res;
-  res.x = fma(a.x, b.x, c.x);
-  res.y = fma(a.y, b.y, c.y);
-  return res;
-}
-
-inline Float8_ fma(Bfloat8_ a, Bfloat8_ b, Float8_ c) {
-  float4 x = fma(a.x, b.x, c.x);
-  float4 y = fma(a.y, b.y, c.y);
-  Float8_ res;
-  res.x = x;
-  res.y = y;
-  return res;
-}
-inline Bfloat8_ fma(Bfloat8_ a, Bfloat8_ b, Bfloat8_ c) {
-  Bfloat8_ res;
-  res.x = fma(a.x, b.x, c.x);
-  res.y = fma(a.y, b.x, c.y);
-  return c;
-}
-
-inline void from_float(thread bfloat16_t& dst, float src) {
-  dst = static_cast<bfloat16_t>(src);
-}
-inline void from_float(thread Bfloat2_& dst, float2 src) {
-  dst.x = static_cast<bfloat16_t>(src.x);
-  dst.y = static_cast<bfloat16_t>(src.y);
-}
-inline void from_float(thread Bfloat4_& dst, float4 src) {
-  dst.x.x = static_cast<bfloat16_t>(src.x);
-  dst.x.y = static_cast<bfloat16_t>(src.y);
-  dst.y.x = static_cast<bfloat16_t>(src.z);
-  dst.y.y = static_cast<bfloat16_t>(src.w);
-}
-inline void from_float(thread Bfloat8_& dst, Float8_ src) {
-  Bfloat4_ x;
-  Bfloat4_ y;
-  from_float(x, src.x);
-  from_float(y, src.y);
-  dst.x = x;
-  dst.y = y;
-}
-
-// #endif
-
-
-
-
-
-// FP16 vector data types.
-struct Half8_ {
-  half4 x;
-  half4 y;
-};
-
-template<>
-struct Vec<half, 1> {
-  using Type = half;
-};
-template<>
-struct Vec<half, 2> {
-  using Type = half2;
-};
-template<>
-struct Vec<half, 4> {
-  using Type = half4;
-};
-template<>
-struct Vec<half, 8> {
-  using Type = Half8_;
-};
-
-template<>
-struct FloatVec<half> {
-  using Type = float;
-};
-template<>
-struct FloatVec<half2> {
-  using Type = float2;
-};
-template<>
-struct FloatVec<half4> {
-  using Type = float4;
-};
-template<>
-struct FloatVec<Half8_> {
-  using Type = Float8_;
-};
-
-template<>
-inline float mul(half a, half b) {
-  return (float)a * (float)b;
-}
-template<>
-inline half mul(half a, half b) {
-  return a*b;
-}
-
-template<>
-inline float2 mul(half2 a, half2 b) {
-  return (float2)a * (float2)b;
-}
-template<>
-inline half2 mul(half2 a, half2 b) {
-  return a * b;
-}
-
-template<>
-inline float4 mul(half4 a, half4 b) {
-  return (float4)a * (float4)b;
-}
-template<>
-inline half4 mul(half4 a, half4 b) {
-  return a * b;
-}
-
-template<>
-inline Float8_ mul(Half8_ a, Half8_ b) {
-  float4 x = mul<float4, half4, half4>(a.x, b.x);
-  float4 y = mul<float4, half4, half4>(a.y, b.y);
-  Float8_ c;
-  c.x = x;
-  c.y = y;
-  return c;
-}
-template<>
-inline Half8_ mul(Half8_ a, Half8_ b) {
-  Half8_ c;
-  c.x = mul<half4, half4, half4>(a.x, b.x);
-  c.y = mul<half4, half4, half4>(a.y, b.y);
-  return c;
-}
-
-template<>
-inline float sum(half a) {
-  return (float)a;
-}
-
-template<>
-inline float sum(half2 a) {
-  return (float)a.x + (float)a.y;
-}
-
-template<>
-inline float sum(half4 a) {
-  return sum(a.x) + sum(a.y);
-}
-
-template<>
-inline float sum(Half8_ a) {
-  return sum(a.x) + sum(a.y);
-}
-
-inline float fma(half a, half b, float c) {
-  return (float)a * (float)b + c;
-}
-
-inline float2 fma(half2 a, half2 b, float2 c) {
-  return (float2)a * (float2)b + c;
-}
-
-inline float4 fma(half4 a, half4 b, float4 c) {
-  return (float4)a * (float4)b + c;
-}
-
-inline Float8_ fma(Half8_ a, Half8_ b, Float8_ c) {
-  float4 x = fma(a.x, b.x, c.x);
-  float4 y = fma(a.y, b.y, c.y);
-  Float8_ res;
-  res.x = x;
-  res.y = y;
-  return res;
-}
-inline Half8_ fma(Half8_ a, Half8_ b, Half8_ c) {
-  Half8_ res;
-  res.x = fma(a.x, b.x, c.x);
-  res.y = fma(a.y, b.x, c.y);
-  return c;
-}
-
-inline void from_float(thread half& dst, float src) {
-  dst = static_cast<half>(src);
-}
-inline void from_float(thread half2& dst, float2 src) {
-  dst.x = static_cast<half>(src.x);
-  dst.y = static_cast<half>(src.y);
-}
-inline void from_float(thread half4& dst, float4 src) {
-  dst.x = static_cast<half>(src.x);
-  dst.y = static_cast<half>(src.y);
-  dst.z = static_cast<half>(src.z);
-  dst.w = static_cast<half>(src.w);
-}
-inline void from_float(thread Half8_& dst, Float8_ src) {
-  half4 x;
-  half4 y;
-  from_float(x, src.x);
-  from_float(y, src.y);
-  dst.x = x;
-  dst.y = y;
-}
 
 // ========================================== Dot product utilities
 
-// TODO(EricLBuehler): optimize with vectorization
 template<int THREAD_GROUP_SIZE, typename Vec, int N>
 inline float qk_dot_(const threadgroup Vec (&q)[N], const thread Vec (&k)[N]) {
   // Compute the parallel products for Q*K^T (treat vector lanes separately).
@@ -975,14 +78,14 @@ inline float block_sum(threadgroup float* red_smem, float sum, uint simd_tid, ui
 constant bool use_partitioning [[function_constant(10)]];
 constant bool use_alibi [[function_constant(20)]];
 
-template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS, int NUM_SIMD_LANES, int PARTITION_SIZE = 0>
+template <typename T, typename cache_t, bool is_quantized, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS, int NUM_SIMD_LANES, int PARTITION_SIZE = 0>
 [[kernel]] void paged_attention(
     device float* exp_sums [[buffer(0), function_constant(use_partitioning)]],         // [num_seqs, num_heads, max_num_partitions]
     device float* max_logits [[buffer(1), function_constant(use_partitioning)]],       // [num_seqs, num_heads, max_num_partitions]
     device T* out [[buffer(2)]],              // [num_seqs, num_heads, max_num_partitions, head_size]
     device const T* q [[buffer(3)]],          // [num_seqs, num_heads, head_size]
-    device const T* k_cache [[buffer(4)]],    // [num_blocks, num_kv_heads, head_size/x, block_size, x]
-    device const T* v_cache [[buffer(5)]],    // [num_blocks, num_kv_heads, head_size, block_size]
+    device const cache_t* k_cache [[buffer(4)]],    // [num_blocks, num_kv_heads, head_size/x, block_size, x]
+    device const cache_t* v_cache [[buffer(5)]],    // [num_blocks, num_kv_heads, head_size, block_size]
     const constant int& num_kv_heads [[buffer(6)]],     // [num_heads]
     const constant float& scale [[buffer(7)]],
     const constant float& softcapping [[buffer(8)]],
@@ -993,6 +96,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS, int NUM_SI
     const constant int& q_stride [[buffer(13)]],
     const constant int& kv_block_stride [[buffer(14)]],
     const constant int& kv_head_stride [[buffer(15)]],
+    const constant float& k_scale [[buffer(16)]],
+    const constant float& v_scale [[buffer(17)]],
     threadgroup char* shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -1046,6 +151,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS, int NUM_SI
   constexpr int VEC_SIZE = MAX(16 / (THREAD_GROUP_SIZE * sizeof(T)), 1);
   using K_vec = typename Vec<T, VEC_SIZE>::Type;
   using Q_vec = typename Vec<T, VEC_SIZE>::Type;
+  using Quant_vec = typename Vec<cache_t, VEC_SIZE>::Type;
 
   constexpr int NUM_ELEMS_PER_THREAD = HEAD_SIZE / THREAD_GROUP_SIZE;
   constexpr int NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD / VEC_SIZE;
@@ -1074,7 +180,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS, int NUM_SI
 
   // x == THREAD_GROUP_SIZE * VEC_SIZE
   // Each thread group fetches x elements from the key at a time.
-  constexpr int x = 16 / sizeof(T);
+  constexpr int x = 16 / sizeof(cache_t);
   float qk_max = -FLT_MAX;
 
   // Iterate over the key blocks.
@@ -1100,13 +206,22 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS, int NUM_SI
 
 #pragma unroll
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
-        const device T* k_ptr = k_cache + physical_block_number * kv_block_stride
+        const device cache_t* k_ptr = k_cache + physical_block_number * kv_block_stride
                                         + kv_head_idx * kv_head_stride
                                         + physical_block_offset * x;
         const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
         const int offset1 = (vec_idx * VEC_SIZE) / x;
         const int offset2 = (vec_idx * VEC_SIZE) % x;
-        k_vecs[j] = *reinterpret_cast<const device K_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+
+        if constexpr (!is_quantized) {
+          k_vecs[j] = *reinterpret_cast<const device K_vec*>(
+              k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+        } else {
+          Quant_vec fp8_k_vec = *reinterpret_cast<const device Quant_vec*>(
+              k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+          
+          k_vecs[j] = scaled_convert<K_vec, Quant_vec>(fp8_k_vec, k_scale);
+        }
       }
 
       // Compute dot product.
@@ -1210,7 +325,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS, int NUM_SI
     Float_L_vec logits_float_vec = *reinterpret_cast<threadgroup Float_L_vec*>(logits + token_idx - start_token_idx);
     from_float(logits_vec, logits_float_vec);
 
-    const device T* v_ptr = v_cache + physical_block_number * kv_block_stride
+    const device cache_t* v_ptr = v_cache + physical_block_number * kv_block_stride
                                     + kv_head_idx * kv_head_stride;
 #pragma unroll
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
@@ -1220,7 +335,14 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS, int NUM_SI
         // NOTE: When v_vec contains the tokens that are out of the context,
         // we should explicitly zero out the values since they may contain NaNs.
         // See https://github.com/vllm-project/vllm/issues/641#issuecomment-1682544472
-        V_vec v_vec = *reinterpret_cast<const device V_vec*>(v_ptr + offset);
+        V_vec v_vec;
+        if constexpr (!is_quantized) {
+          v_vec = *reinterpret_cast<const device V_vec*>(v_ptr + offset);
+        } else {
+          Quant_vec fp8_v_vec = *reinterpret_cast<const device Quant_vec *>(v_ptr + offset);
+          v_vec = scaled_convert<V_vec, Quant_vec>(fp8_v_vec, v_scale);
+        }
+
         if (block_idx == num_context_blocks - 1) {
           thread T* v_vec_ptr = reinterpret_cast<thread T*>(&v_vec);
 #pragma unroll
@@ -1295,7 +417,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS, int NUM_SI
   }
 }
 
-template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES, int PARTITION_SIZE = 0>
+template <typename T, typename cache_t, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES, int PARTITION_SIZE = 0>
 [[kernel]] void paged_attention_v2_reduce(
     device T* out [[buffer(0)]],
     const device float* exp_sums [[buffer(1)]],
@@ -1395,15 +517,15 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES, int PA
   }
 }
 
-#define instantiate_paged_attention_inner(type, head_size, block_size, num_threads, num_simd_lanes, partition_size)                                               \
-  template [[host_name("paged_attention_" #type "_hs" #head_size "_bs" #block_size "_nt" #num_threads "_nsl" #num_simd_lanes "_ps" #partition_size)]]  \
-  [[kernel]] void paged_attention<type, head_size, block_size, num_threads, num_simd_lanes, partition_size>(                                            \
+#define instantiate_paged_attention_inner(type, cache_type, is_quantized, head_size, block_size, num_threads, num_simd_lanes, partition_size)                                               \
+  template [[host_name("paged_attention_" #type "_" #cache_type "_hs" #head_size "_bs" #block_size "_nt" #num_threads "_nsl" #num_simd_lanes "_ps" #partition_size)]]  \
+  [[kernel]] void paged_attention<type, cache_type, is_quantized, head_size, block_size, num_threads, num_simd_lanes, partition_size>(                                            \
       device float* exp_sums [[buffer(0), function_constant(use_partitioning)]],                                             \
       device float* max_logits [[buffer(1), function_constant(use_partitioning)]],                                            \
       device type* out [[buffer(2)]],                                            \
       device const type* q [[buffer(3)]],                                            \
-      device const type* k_cache [[buffer(4)]],                                            \
-      device const type* v_cache [[buffer(5)]],                                            \
+      device const cache_type* k_cache [[buffer(4)]],                                            \
+      device const cache_type* v_cache [[buffer(5)]],                                            \
       const constant int& num_kv_heads [[buffer(6)]],                                          \
       const constant float& scale [[buffer(7)]],                                            \
       const constant float& softcapping [[buffer(8)]],                                            \
@@ -1414,6 +536,8 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES, int PA
       const constant int& q_stride [[buffer(13)]],                                            \
       const constant int& kv_block_stride [[buffer(14)]],                                            \
       const constant int& kv_head_stride [[buffer(15)]],                                            \
+      const constant float& k_scale [[buffer(16)]],                                            \
+      const constant float& v_scale [[buffer(17)]],                                            \
       threadgroup char* shared_mem [[threadgroup(0)]],                                            \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],                                            \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                                            \
@@ -1421,9 +545,9 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES, int PA
       uint simd_tid [[simdgroup_index_in_threadgroup]],                                            \
       uint simd_lid [[thread_index_in_simdgroup]]);                                            \
 
-#define instantiate_paged_attention_v2_reduce_inner(type, head_size, num_threads, num_simd_lanes, partition_size)                                               \
-  template [[host_name("paged_attention_v2_reduce_" #type "_hs" #head_size "_nt" #num_threads "_nsl" #num_simd_lanes "_ps" #partition_size)]]  \
-  [[kernel]] void paged_attention_v2_reduce<type, head_size, num_threads, num_simd_lanes, partition_size>(             \
+#define instantiate_paged_attention_v2_reduce_inner(type, cache_type, head_size, num_threads, num_simd_lanes, partition_size)                                               \
+  template [[host_name("paged_attention_v2_reduce_" #type "_" #cache_type "_hs" #head_size "_nt" #num_threads "_nsl" #num_simd_lanes "_ps" #partition_size)]]  \
+  [[kernel]] void paged_attention_v2_reduce<type, cache_type, head_size, num_threads, num_simd_lanes, partition_size>(             \
       device type* out [[buffer(0)]],             \
       const device float* exp_sums [[buffer(1)]],             \
       const device float* max_logits [[buffer(2)]],             \
@@ -1439,41 +563,50 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES, int PA
       uint simd_lid [[thread_index_in_simdgroup]]);             \
 
 
-#define instantiate_paged_attention_heads(type, block_size, num_threads, num_simd_lanes, partition_size) \
-  instantiate_paged_attention_inner(type, 64, block_size, num_threads, num_simd_lanes, partition_size)         \
-  instantiate_paged_attention_inner(type, 80, block_size, num_threads, num_simd_lanes, partition_size)         \
-  instantiate_paged_attention_inner(type, 96, block_size, num_threads, num_simd_lanes, partition_size)         \
-  instantiate_paged_attention_inner(type, 112, block_size, num_threads, num_simd_lanes, partition_size)         \
-  instantiate_paged_attention_inner(type, 128, block_size, num_threads, num_simd_lanes, partition_size)         \
-  instantiate_paged_attention_inner(type, 256, block_size, num_threads, num_simd_lanes, partition_size)
+#define instantiate_paged_attention_heads(type, cache_type, is_quantized, block_size, num_threads, num_simd_lanes, partition_size) \
+  instantiate_paged_attention_inner(type, cache_type, is_quantized, 64, block_size, num_threads, num_simd_lanes, partition_size)         \
+  instantiate_paged_attention_inner(type, cache_type, is_quantized, 80, block_size, num_threads, num_simd_lanes, partition_size)         \
+  instantiate_paged_attention_inner(type, cache_type, is_quantized, 96, block_size, num_threads, num_simd_lanes, partition_size)         \
+  instantiate_paged_attention_inner(type, cache_type, is_quantized, 112, block_size, num_threads, num_simd_lanes, partition_size)         \
+  instantiate_paged_attention_inner(type, cache_type, is_quantized, 128, block_size, num_threads, num_simd_lanes, partition_size)         \
+  instantiate_paged_attention_inner(type, cache_type, is_quantized, 256, block_size, num_threads, num_simd_lanes, partition_size)
 
-#define instantiate_paged_attention_v2_reduce_heads(type, num_threads, num_simd_lanes, partition_size) \
-  instantiate_paged_attention_v2_reduce_inner(type, 64, num_threads, num_simd_lanes, partition_size)         \
-  instantiate_paged_attention_v2_reduce_inner(type, 80, num_threads, num_simd_lanes, partition_size)         \
-  instantiate_paged_attention_v2_reduce_inner(type, 96, num_threads, num_simd_lanes, partition_size)         \
-  instantiate_paged_attention_v2_reduce_inner(type, 112, num_threads, num_simd_lanes, partition_size)         \
-  instantiate_paged_attention_v2_reduce_inner(type, 128, num_threads, num_simd_lanes, partition_size)         \
-  instantiate_paged_attention_v2_reduce_inner(type, 256, num_threads, num_simd_lanes, partition_size)
+#define instantiate_paged_attention_v2_reduce_heads(type, cache_type, num_threads, num_simd_lanes, partition_size) \
+  instantiate_paged_attention_v2_reduce_inner(type, cache_type, 64, num_threads, num_simd_lanes, partition_size)         \
+  instantiate_paged_attention_v2_reduce_inner(type, cache_type, 80, num_threads, num_simd_lanes, partition_size)         \
+  instantiate_paged_attention_v2_reduce_inner(type, cache_type, 96, num_threads, num_simd_lanes, partition_size)         \
+  instantiate_paged_attention_v2_reduce_inner(type, cache_type, 112, num_threads, num_simd_lanes, partition_size)         \
+  instantiate_paged_attention_v2_reduce_inner(type, cache_type, 128, num_threads, num_simd_lanes, partition_size)         \
+  instantiate_paged_attention_v2_reduce_inner(type, cache_type, 256, num_threads, num_simd_lanes, partition_size)
 
-#define instantiate_paged_attention_block_size(type, num_threads, num_simd_lanes, partition_size) \
-  instantiate_paged_attention_heads(type, 32, num_threads, num_simd_lanes, partition_size)         \
-  instantiate_paged_attention_heads(type, 64, num_threads, num_simd_lanes, partition_size)
+#define instantiate_paged_attention_block_size(type, cache_type, is_quantized, num_threads, num_simd_lanes, partition_size) \
+  instantiate_paged_attention_heads(type, cache_type, is_quantized, 32, num_threads, num_simd_lanes, partition_size)         \
+  instantiate_paged_attention_heads(type, cache_type, is_quantized, 64, num_threads, num_simd_lanes, partition_size)
 
 // TODO: tune num_threads = 256
 // NOTE: partition_size = 0
-#define instantiate_paged_attention_v1(type, num_simd_lanes) \
-  instantiate_paged_attention_block_size(type, 256, num_simd_lanes, 0)
+#define instantiate_paged_attention_v1(type, cache_type, is_quantized, num_simd_lanes) \
+  instantiate_paged_attention_block_size(type, cache_type, is_quantized, 256, num_simd_lanes, 0)
 
 // TODO: tune num_threads = 256
 // NOTE: partition_size = 512
-#define instantiate_paged_attention_v2(type, num_simd_lanes) \
-  instantiate_paged_attention_block_size(type, 256, num_simd_lanes, 512) \
-  instantiate_paged_attention_v2_reduce_heads(type, 256, num_simd_lanes, 512)
+#define instantiate_paged_attention_v2(type, cache_type, is_quantized, num_simd_lanes) \
+  instantiate_paged_attention_block_size(type, cache_type, is_quantized, 256, num_simd_lanes, 512) \
+  instantiate_paged_attention_v2_reduce_heads(type, cache_type, 256, num_simd_lanes, 512)
 
-instantiate_paged_attention_v1(float, 32)
-instantiate_paged_attention_v1(bfloat16_t, 32)
-instantiate_paged_attention_v1(half, 32)
+instantiate_paged_attention_v1(float, float, false, 32)
+instantiate_paged_attention_v1(bfloat16_t, bfloat16_t, false, 32)
+instantiate_paged_attention_v1(half, half, false, 32)
 
-instantiate_paged_attention_v2(float, 32)
-instantiate_paged_attention_v2(bfloat16_t, 32)
-instantiate_paged_attention_v2(half, 32)
+instantiate_paged_attention_v2(float, float, false, 32)
+instantiate_paged_attention_v2(bfloat16_t, bfloat16_t, false, 32)
+instantiate_paged_attention_v2(half, half, false, 32)
+
+// quantized
+instantiate_paged_attention_v1(float, uint8_t, true, 32)
+instantiate_paged_attention_v1(bfloat16_t, uint8_t, true, 32)
+instantiate_paged_attention_v1(half, uint8_t, true, 32)
+
+instantiate_paged_attention_v2(float, uint8_t, true, 32)
+instantiate_paged_attention_v2(bfloat16_t, uint8_t, true, 32)
+instantiate_paged_attention_v2(half, uint8_t, true, 32)
