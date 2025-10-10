@@ -6,8 +6,8 @@ extern "C" {
         value: *const c_void,
         key_cache: *const c_void,
         value_cache: *const c_void,
-        k_scale: f32,
-        v_scale: f32,
+        k_scale: *const c_void,
+        v_scale: *const c_void,
         slot_mapping: *const c_long,
 
         num_tokens: c_int,
@@ -26,8 +26,8 @@ extern "C" {
         value: *const c_void,       // [num_tokens, num_heads, head_size]
         key_cache: *const c_void,   // [num_blocks, block_size, num_heads, head_size]
         value_cache: *const c_void, // [num_blocks, block_size, num_heads, head_size]
-        k_scale: f32,
-        v_scale: f32,
+        k_scale: *const c_void,
+        v_scale: *const c_void,
         slot_mapping: *const c_long, // [num_tokens]
 
         num_tokens: c_int,
@@ -48,8 +48,8 @@ extern "C" {
         query: *const c_void,
         key_cache: *const c_void,
         value_cache: *const c_void,
-        k_scale: f32,
-        v_scale: f32,
+        k_scale: *const c_void,
+        v_scale: *const c_void,
         num_kv_heads: c_int,
         scale: f32,
         block_tables: *const c_int,
@@ -78,8 +78,8 @@ extern "C" {
         query: *const c_void,
         key_cache: *const c_void,
         value_cache: *const c_void,
-        k_scale: f32,
-        v_scale: f32,
+        k_scale: *const c_void,
+        v_scale: *const c_void,
         num_kv_heads: c_int,
         scale: f32,
         block_tables: *const c_int,
@@ -105,8 +105,8 @@ extern "C" {
         query: *const c_void,
         key_cache: *const c_void,
         value_cache: *const c_void,
-        k_scale: f32,
-        v_scale: f32,
+        k_scale: *const c_void,
+        v_scale: *const c_void,
         num_kv_heads: c_int,
         scale: f32,
         block_tables: *const c_int,

@@ -24,7 +24,7 @@
 #include "attention/attention_dtypes.h"
 #include "attention/attention_utils.cuh"
 #include "pagedattention.cuh"
-#include <algorithm>
+#include <stdexcept>
 
 #ifndef USE_ROCM
 #define WARP_SIZE 32
@@ -43,8 +43,8 @@
     reinterpret_cast<T*>(query),                                                              \
     reinterpret_cast<cache_T*>(key_cache),                                                          \
     reinterpret_cast<cache_T*>(value_cache),                                                        \
-    k_scale,                                                          \
-    v_scale,                                                        \
+    reinterpret_cast<float*>(k_scales),                                                          \
+    reinterpret_cast<float*>(v_scales),                                                        \
     num_kv_heads,                                                                             \
     scale,                                                                                    \
     block_tables,                                                                             \
@@ -67,8 +67,8 @@ void paged_attention_v1_launcher(
   void *query,
   void *key_cache,
   void *value_cache,
-  float k_scale,
-  float v_scale,
+  void* k_scales,
+  void* v_scales,
   int num_kv_heads,
   float scale,
   int32_t *block_tables,
@@ -136,8 +136,8 @@ void paged_attention_v1_launcher(
     query,                                                          \
     key_cache,                                                      \
     value_cache,                                                    \
-    k_scale,                                                      \
-    v_scale,                                                    \
+    k_scales,                                                      \
+    v_scales,                                                    \
     num_kv_heads,                                                   \
     scale,                                                          \
     block_tables,                                                   \
@@ -172,8 +172,8 @@ extern "C" void paged_attention_v1(
   void *query,           // [num_seqs, num_heads, head_size]
   void *key_cache,       // [num_blocks, num_heads, head_size/x, block_size, x]
   void *value_cache,     // [num_blocks, num_heads, head_size, block_size]
-  float k_scale,
-  float v_scale,
+  void* k_scales,
+  void* v_scales,
   int32_t num_kv_heads,               // [num_heads]
   float scale,
   int32_t *block_tables,    // [num_seqs, max_num_blocks_per_seq]
@@ -193,7 +193,7 @@ extern "C" void paged_attention_v1(
   float softscapping,
   int64_t stream
   ) {
-  bool is_quantized = (k_scale != 1.0) && (v_scale != 1.0);
+  bool is_quantized = (k_scales != nullptr) && (v_scales != nullptr);
   if (!is_quantized) {
     if (dtype == 2) {
       CALL_V1_LAUNCHER_BLOCK_SIZE(float, float);

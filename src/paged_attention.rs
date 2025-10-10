@@ -13,8 +13,8 @@ struct PagedAttention {
     softcapping: f32,
     key_cache: Tensor,
     value_cache: Tensor,
-    k_scale: Option<f32>,
-    v_scale: Option<f32>,
+    k_scales: Option<Tensor>,
+    v_scales: Option<Tensor>,
     block_tables: Tensor,
     context_lens: Tensor,
     alibi_slopes: Option<Tensor>,
@@ -98,7 +98,7 @@ impl PagedAttention {
 
         // Get cuda slices for all tensors
         let q = q.as_cuda_slice::<T>()?;
-        let kc_ptr = if self.k_scale.is_some() {
+        let kc_ptr = if self.k_scales.is_some() {
             let kc = kc.as_cuda_slice::<u8>()?;
             let kc = kc.slice(kc_l.start_offset()..);
             *kc.device_ptr() as *const core::ffi::c_void
@@ -108,7 +108,7 @@ impl PagedAttention {
             *kc.device_ptr() as *const core::ffi::c_void
         };
 
-        let vc_ptr = if self.v_scale.is_some() {
+        let vc_ptr = if self.v_scales.is_some() {
             let vc = vc.as_cuda_slice::<u8>()?;
             let vc = vc.slice(vc_l.start_offset()..);
             *vc.device_ptr() as *const core::ffi::c_void
@@ -173,6 +173,29 @@ impl PagedAttention {
             )
         }
 
+        let (k_scales_ptr, v_scales_ptr) =
+            if let (Some(k_scales), Some(v_scales)) = (&self.k_scales, &self.v_scales) {
+                let (k_scales, k_scales_layout) = k_scales.storage_and_layout();
+                let k_scales = match &*k_scales {
+                    candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+                    _ => candle::bail!("k_scales must be a cuda tensor"),
+                };
+                let k_scales = k_scales.slice(k_scales_layout.start_offset()..);
+
+                let (v_scales, v_scales_layout) = v_scales.storage_and_layout();
+                let v_scales = match &*v_scales {
+                    candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+                    _ => candle::bail!("v_scales must be a cuda tensor"),
+                };
+                let v_scales = v_scales.slice(v_scales_layout.start_offset()..);
+                (
+                    *k_scales.device_ptr() as *const core::ffi::c_void,
+                    *v_scales.device_ptr() as *const core::ffi::c_void,
+                )
+            } else {
+                (std::ptr::null(), std::ptr::null())
+            };
+
         let q_stride = q_l.stride()[0];
         let kv_block_stride = kc_l.stride()[0];
         let kv_head_stride = kc_l.stride()[1];
@@ -210,8 +233,8 @@ impl PagedAttention {
                     q_ptr,
                     kc_ptr,
                     vc_ptr,
-                    self.k_scale.unwrap_or(1.0),
-                    self.v_scale.unwrap_or(1.0),
+                    k_scales_ptr,
+                    v_scales_ptr,
                     num_kv_heads as c_int,
                     self.softmax_scale,
                     bt_ptr,
@@ -243,8 +266,8 @@ impl PagedAttention {
                     q_ptr,
                     kc_ptr,
                     vc_ptr,
-                    self.k_scale.unwrap_or(1.0),
-                    self.v_scale.unwrap_or(1.0),
+                    k_scales_ptr,
+                    v_scales_ptr,
                     num_kv_heads as c_int,
                     self.softmax_scale,
                     bt_ptr,
@@ -283,8 +306,8 @@ impl PagedAttention {
                     q_ptr,
                     kc_ptr,
                     vc_ptr,
-                    self.k_scale.unwrap_or(1.0),
-                    self.v_scale.unwrap_or(1.0),
+                    k_scales_ptr,
+                    v_scales_ptr,
                     num_kv_heads as c_int,
                     self.softmax_scale,
                     bt_ptr,
@@ -525,8 +548,8 @@ impl PagedAttention {
                 q_stride as i32,
                 kv_block_stride as i32,
                 kv_head_stride as i32,
-                self.k_scale.unwrap_or(1.0),
-                self.v_scale.unwrap_or(1.0),
+                1.0f32,
+                1.0f32,
             )
             .map_err(candle_core::Error::wrap)?;
         } else {
@@ -577,8 +600,8 @@ impl PagedAttention {
                 q_stride as i32,
                 kv_block_stride as i32,
                 kv_head_stride as i32,
-                self.k_scale.unwrap_or(1.0),
-                self.v_scale.unwrap_or(1.0),
+                1.0f32,
+                1.0f32,
             )
             .map_err(candle_core::Error::wrap)?;
         }
@@ -638,8 +661,8 @@ pub fn paged_attention(
     q: &Tensor,
     key_cache: &Tensor,
     value_cache: &Tensor,
-    k_scale: Option<f32>,
-    v_scale: Option<f32>,
+    k_scales: Option<&Tensor>,
+    v_scales: Option<&Tensor>,
     block_tables: &Tensor,
     context_lens: &Tensor,
     alibi_slopes: Option<&Tensor>,
@@ -659,8 +682,8 @@ pub fn paged_attention(
         softmax_scale,
         key_cache: key_cache.to_owned(),
         value_cache: value_cache.to_owned(),
-        k_scale,
-        v_scale,
+        k_scales: k_scales.to_owned().cloned(),
+        v_scales: v_scales.to_owned().cloned(),
         block_tables: block_tables.to_owned(),
         context_lens: context_lens.to_owned(),
         alibi_slopes: alibi_slopes.to_owned().cloned(),
@@ -677,8 +700,8 @@ struct ReshapeCache {
     value: Tensor,
     key_cache: Tensor,
     value_cache: Tensor,
-    k_scale: Option<f32>,
-    v_scale: Option<f32>,
+    k_scales: Option<Tensor>,
+    v_scales: Option<Tensor>,
     slot_mapping: Tensor,
 }
 
@@ -724,7 +747,7 @@ impl ReshapeCache {
             _ => candle::bail!("value_cache must be a cuda tensor"),
         };
 
-        let kc_ptr = if self.k_scale.is_some() {
+        let kc_ptr = if self.k_scales.is_some() {
             let kc = kc.as_cuda_slice::<u8>()?;
             let kc = kc.slice(kc_l.start_offset()..);
             *kc.device_ptr() as *const core::ffi::c_void
@@ -734,7 +757,7 @@ impl ReshapeCache {
             *kc.device_ptr() as *const core::ffi::c_void
         };
 
-        let vc_ptr = if self.v_scale.is_some() {
+        let vc_ptr = if self.v_scales.is_some() {
             let vc = vc.as_cuda_slice::<u8>()?;
             let vc = vc.slice(vc_l.start_offset()..);
             *vc.device_ptr() as *const core::ffi::c_void
@@ -841,11 +864,36 @@ impl ReshapeCache {
         let k_ptr = *k.device_ptr() as *const core::ffi::c_void;
         let v_ptr = *v.device_ptr() as *const core::ffi::c_void;
         let s_ptr = *s.device_ptr() as *const core::ffi::c_long;
+
+        let (k_scales_ptr, v_scales_ptr) =
+            if let (Some(k_scales), Some(v_scales)) = (&self.k_scales, &self.v_scales) {
+                let (k_scales, k_scales_layout) = k_scales.storage_and_layout();
+                let k_scales = match &*k_scales {
+                    candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+                    _ => candle::bail!("k_scales must be a cuda tensor"),
+                };
+                let k_scales = k_scales.slice(k_scales_layout.start_offset()..);
+
+                let (v_scales, v_scales_layout) = v_scales.storage_and_layout();
+                let v_scales = match &*v_scales {
+                    candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+                    _ => candle::bail!("v_scales must be a cuda tensor"),
+                };
+                let v_scales = v_scales.slice(v_scales_layout.start_offset()..);
+
+                (
+                    *k_scales.device_ptr() as *const core::ffi::c_void,
+                    *v_scales.device_ptr() as *const core::ffi::c_void,
+                )
+            } else {
+                (std::ptr::null(), std::ptr::null())
+            };
+
         unsafe {
             #[cfg(feature = "flash-decoding")]
             {
                 assert!(
-                    !self.k_scale.is_none() && !self.v_scale.is_none(),
+                    !k_scales_ptr.is_null() && !v_scales_ptr.is_null(),
                     "fp8 kvcache is not supported under flash attention!"
                 );
                 let block_stride = kc_l.stride()[0];
@@ -857,8 +905,8 @@ impl ReshapeCache {
                     v_ptr,  // [num_tokens, num_heads, head_size]
                     kc_ptr, // [num_blocks, block_size, num_heads, head_size]
                     vc_ptr, // [num_blocks, block_size, num_heads, head_size]
-                    self.k_scale.unwrap_or(1.0),
-                    self.v_scale.unwrap_or(1.0),
+                    k_scales_ptr,
+                    v_scales_ptr,
                     s_ptr, // [num_tokens]
                     num_tokens as c_int,
                     num_heads as c_int,
@@ -880,8 +928,8 @@ impl ReshapeCache {
                     v_ptr,
                     kc_ptr,
                     vc_ptr,
-                    self.k_scale.unwrap_or(1.0),
-                    self.v_scale.unwrap_or(1.0),
+                    k_scales_ptr,
+                    v_scales_ptr,
                     s_ptr,
                     num_tokens as c_int,
                     num_heads as c_int,
@@ -1025,8 +1073,8 @@ impl ReshapeCache {
             x as i32,
             key_stride,
             value_stride,
-            self.k_scale.unwrap_or(1.0),
-            self.v_scale.unwrap_or(1.0),
+            1.0f32,
+            1.0f32,
         )
         .map_err(candle_core::Error::wrap)?;
 
@@ -1104,16 +1152,16 @@ pub fn reshape_and_cache(
     value: &Tensor,
     key_cache: &Tensor,
     value_cache: &Tensor,
-    k_scale: Option<f32>,
-    v_scale: Option<f32>,
+    k_scales: Option<&Tensor>,
+    v_scales: Option<&Tensor>,
     slot_mapping: &Tensor,
 ) -> Result<()> {
     let op = ReshapeCache {
         value: value.to_owned(),
         key_cache: key_cache.to_owned(),
         value_cache: value_cache.to_owned(),
-        k_scale,
-        v_scale,
+        k_scales: k_scales.to_owned().cloned(),
+        v_scales: v_scales.to_owned().cloned(),
         slot_mapping: slot_mapping.to_owned(),
     };
     key.inplace_op1(&op)

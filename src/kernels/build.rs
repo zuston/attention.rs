@@ -50,6 +50,7 @@ fn main() -> Result<()> {
     if compute_cap < 800 {
         builder = builder.arg("-DNO_BF16_KERNEL");
         builder = builder.arg("-DNO_MARLIN_KERNEL");
+        builder = builder.arg("-DNO_HARDWARE_FP8");
     }
 
     if marlin_disabled {

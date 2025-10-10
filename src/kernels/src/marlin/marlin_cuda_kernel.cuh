@@ -21,6 +21,7 @@
 #include <cuda_fp16.h>
 #include <assert.h>
 #include <iostream>
+#include <stdexcept>
 #include "marlin_dtypes.cuh"
 using namespace marlin;
 

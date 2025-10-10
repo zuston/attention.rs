@@ -1,6 +1,10 @@
 pub mod paged_attention;
+pub mod scale_collector;
 use candle_core::{Device, Result, Tensor};
 use paged_attention::{paged_attention, reshape_and_cache};
+use parking_lot::RwLock;
+use scale_collector::KvScaleCalculator;
+use std::sync::Arc;
 #[cfg(feature = "cuda")]
 pub mod sort;
 #[cfg(feature = "cuda")]
@@ -28,6 +32,7 @@ pub struct PagedAttention {
     sliding_window: Option<usize>,
     num_queries_per_kv: usize,
     alibi_slopes: Option<Tensor>,
+    collector: Option<Arc<RwLock<KvScaleCalculator>>>,
 }
 
 impl PagedAttention {
@@ -39,6 +44,7 @@ impl PagedAttention {
         sliding_window: Option<usize>,
         device: Device,
         alibi_slopes: Option<Vec<f64>>,
+        fp8_kvcache: bool,
     ) -> Result<Self> {
         let num_key_value_heads = num_key_value_heads.unwrap_or(num_attention_heads);
         let num_queries_per_kv = num_attention_heads / num_key_value_heads;
@@ -55,6 +61,11 @@ impl PagedAttention {
             sliding_window,
             num_queries_per_kv,
             alibi_slopes,
+            collector: if fp8_kvcache {
+                Some(Arc::new(RwLock::new(KvScaleCalculator::new(&device)?)))
+            } else {
+                None
+            },
         })
     }
 
@@ -229,9 +240,40 @@ impl PagedAttention {
         value_cache: Option<Tensor>,
         input_metadata: &InputMetadata,
         softcapping: Option<f64>,
-        k_scale: Option<f32>,
-        v_scale: Option<f32>,
     ) -> Result<Tensor> {
+        if let Some(collector) = &self.collector {
+            let mut c = collector.write();
+            if let KvScaleCalculator::InProgress {
+                k_scale: _,
+                v_scale: _,
+                n: _,
+            } = c.clone()
+            {
+                let k_scale = KvScaleCalculator::compute_scale(&key)?;
+                let v_scale = KvScaleCalculator::compute_scale(&value)?;
+                let n = c.collect(&k_scale, &v_scale)?;
+
+                if n == 100 {
+                    c.finish()?;
+                    assert!(matches!(*c, KvScaleCalculator::Done { .. }));
+                }
+            }
+        }
+
+        let (k_scales, v_scales) = if let Some(collector) = &self.collector {
+            let c = collector.read();
+            match c.clone() {
+                KvScaleCalculator::Done { k_scale, v_scale } => (Some(k_scale), Some(v_scale)),
+                KvScaleCalculator::InProgress {
+                    k_scale,
+                    v_scale,
+                    n: _,
+                } => (Some(k_scale), Some(v_scale)),
+            }
+        } else {
+            (None, None)
+        };
+
         let dims = input_metadata.slot_mapping.dims();
         let slot_mapping = if dims.len() > 1 {
             input_metadata.slot_mapping.flatten_all()?
@@ -272,8 +314,8 @@ impl PagedAttention {
                 &value,
                 key_cache.as_ref().unwrap(),
                 value_cache.as_ref().unwrap(),
-                k_scale,
-                v_scale,
+                k_scales.as_ref(),
+                v_scales.as_ref(),
                 &slot_mapping,
             )?;
 
@@ -352,8 +394,8 @@ impl PagedAttention {
             &query,
             key_cache.as_ref().unwrap(),
             value_cache.as_ref().unwrap(),
-            k_scale,
-            v_scale,
+            k_scales.as_ref(),
+            v_scales.as_ref(),
             block_tables,
             context_lens,
             None,

@@ -34,7 +34,7 @@
 
 #include "attention/attention_dtypes.h"
 #include "attention/attention_utils.cuh"
-
+#include <stdexcept>
 #include <algorithm>
 
 #ifndef USE_ROCM
@@ -124,7 +124,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
     const scalar_t* __restrict__ q,          // [num_all_tokens_new, num_query_heads, HEAD]
     const cache_t* __restrict__ k_cache,    // [num_k_blocks, num_kv_heads, HEAD/x, BLOCK_SIZE, x]
     const cache_t* __restrict__ v_cache,    // [num_k_blocks, num_kv_heads, HEAD, BLOCK_SIZE]
-    const float k_scale, const float v_scale,
+    const float* __restrict__ k_scales, const float* v_scales,
     int32_t num_kv_heads,
     float sm_scale,
     const uint32_t* __restrict__ block_tables,
@@ -258,7 +258,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
               continue;
             }
              // Load K vector from kcache
-            #pragma unroll
+            // #pragma unroll
             for (int k = 0; k < NUM_VECS; k++) {
               int d = k * VEC_SIZE;
               int gy = d / X;
@@ -270,7 +270,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
               } else {
                 Quant_vec fp8_k_vec = *reinterpret_cast<const Quant_vec*>(
                     &k_cache[k_idx]);
-                k_vec[k] = vllm::fp8::scaled_convert<K_vec, Quant_vec>(fp8_k_vec, k_scale);
+                k_vec[k] = vllm::fp8::scaled_convert<K_vec, Quant_vec>(fp8_k_vec, *k_scales);
               }
             }
 
@@ -332,7 +332,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
               v = to_float(*reinterpret_cast<const K_vec*>(src));
             } else {
               Quant_vec fp8_v_vec = *reinterpret_cast<const Quant_vec *>(src);
-              v = vllm::fp8::scaled_convert<Float_vec, Quant_vec>(fp8_v_vec, v_scale);
+              v = vllm::fp8::scaled_convert<Float_vec, Quant_vec>(fp8_v_vec, *v_scales);
             }
 
             acc_vec[k] += dot(p_vec[b], v);
@@ -369,7 +369,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
     reinterpret_cast<T*>(query),                                                              \
     reinterpret_cast<cache_T*>(key_cache),                                                          \
     reinterpret_cast<cache_T*>(value_cache),                                                        \
-    k_scale, v_scale,                                                                       \
+    k_scales, v_scales,                                                                       \
     num_kv_heads,                                                                             \
     scale,                                                                                    \
     block_tables,                                                                             \
@@ -399,8 +399,8 @@ void paged_attention_prefill_launcher(
   void *query,
   void *key_cache,
   void *value_cache,
-  float k_scale,
-  float v_scale,
+  float* k_scales,
+  float* v_scales,
   int32_t num_kv_heads,
   float scale,
   uint32_t *block_tables,
@@ -456,8 +456,8 @@ void paged_attention_prefill_launcher(
     query,                                                          \
     key_cache,                                                      \
     value_cache,                                                    \
-    k_scale,                                                      \
-    v_scale,                                                    \
+    reinterpret_cast<float*>(k_scales),                                                      \
+    reinterpret_cast<float*>(v_scales),                                                    \
     num_kv_heads,                                                   \
     scale,                                                          \
     block_tables,                                                   \
@@ -494,8 +494,8 @@ extern "C" void paged_attention_prefill(
   void *query,           // [num_seqs, num_heads, head_size]
   void *key_cache,       // [num_blocks, num_heads, head_size/x, block_size, x]
   void *value_cache,     // [num_blocks, num_heads, head_size, block_size]
-  float k_scale,
-  float v_scale,
+  void * k_scales,
+  void * v_scales,
   int32_t num_kv_heads,               // [num_heads]
   float scale,
   uint32_t *block_tables,    // [num_seqs, max_num_blocks_per_seq]
@@ -523,7 +523,7 @@ extern "C" void paged_attention_prefill(
   int64_t stream
   ) {
 
-  if (k_scale != 1.f || v_scale != 1.f) {
+  if (k_scales != nullptr || v_scales != nullptr) {
 #ifndef NO_FP8_KVCACHE
     if (dtype == 2) {
       // CALL_PREFILL_LAUNCHER_BLOCK_SIZE(float);

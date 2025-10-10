@@ -16,14 +16,14 @@
  * limitations under the License.
  */
 #include <stdint.h>
-
+#include <stdio.h>
 #ifdef USE_ROCM
 #include <hip/hip_runtime.h>
 #endif
 
 #include "attention/attention_dtypes.h"
 #include "attention/attention_utils.cuh"
-
+#include <stdexcept>
 #include <algorithm>
 
 #ifndef USE_ROCM
@@ -102,7 +102,7 @@ __device__ void paged_attention_kernel(
                                           // head_size/x, block_size, x]
     const cache_t* __restrict__ v_cache,  // [num_blocks, num_kv_heads,
                                           // head_size, block_size]
-    const float k_scale, const float v_scale,
+    const float* __restrict__ k_scales, const float* __restrict__ v_scales,
     const int num_kv_heads,               // [num_heads]
     const float scale,
     const int* __restrict__ block_tables,  // [num_seqs, max_num_blocks_per_seq]
@@ -243,8 +243,7 @@ __device__ void paged_attention_kernel(
           using Cache_K_vec = typename vllm::Vec<cache_t, VEC_SIZE>::Type;
           Cache_K_vec fp8_k_vec = *reinterpret_cast<const Cache_K_vec*>(
               k_ptr + offset1 * BLOCK_SIZE * x + offset2);
-          
-          k_vecs[j] = vllm::fp8::scaled_convert<K_vec, Cache_K_vec>(fp8_k_vec, k_scale);
+          k_vecs[j] = vllm::fp8::scaled_convert<K_vec, Cache_K_vec>(fp8_k_vec, *k_scales);
         }
       }
 
@@ -364,7 +363,7 @@ __device__ void paged_attention_kernel(
         } else {
           using Cache_V_vec = typename vllm::Vec<cache_t, V_VEC_SIZE>::Type;
           Cache_V_vec fp8_v_vec = *reinterpret_cast<const Cache_V_vec *>(v_ptr + offset);
-          v_vec = vllm::fp8::scaled_convert<V_vec, Cache_V_vec>(fp8_v_vec, v_scale);
+          v_vec = vllm::fp8::scaled_convert<V_vec, Cache_V_vec>(fp8_v_vec, *v_scales);
         }
         if (block_idx == num_seq_blocks - 1) {
           // NOTE(woosuk): When v_vec contains the tokens that are out of the
@@ -458,8 +457,8 @@ __global__ void paged_attention_v1_kernel(
   const scalar_t* __restrict__ q,         // [num_seqs, num_heads, head_size]
   const cache_t* __restrict__ k_cache,   // [num_blocks, num_kv_heads, head_size/x, block_size, x]
   const cache_t* __restrict__ v_cache,   // [num_blocks, num_kv_heads, head_size, block_size]
-  const float k_scale,
-  const float v_scale,
+  const float* __restrict__ k_scales,
+  const float* __restrict__ v_scales,
   const int num_kv_heads,                 // [num_heads]
   const float scale,
   const int32_t* __restrict__ block_tables,   // [num_seqs, max_num_blocks_per_seq]
@@ -478,7 +477,7 @@ __global__ void paged_attention_v1_kernel(
 
   paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS>(
     /* exp_sums */ nullptr, /* max_logits */ nullptr,
-    out, q, k_cache, v_cache, k_scale, v_scale, num_kv_heads, scale, block_tables, context_lens,
+    out, q, k_cache, v_cache, k_scales, v_scales, num_kv_heads, scale, block_tables, context_lens,
     max_num_blocks_per_seq, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, softscapping);
 }
 
@@ -497,8 +496,8 @@ __global__ void paged_attention_v2_kernel(
   const scalar_t* __restrict__ q,         // [num_seqs, num_heads, head_size]
   const cache_t* __restrict__ k_cache,   // [num_blocks, num_kv_heads, head_size/x, block_size, x]
   const cache_t* __restrict__ v_cache,   // [num_blocks, num_kv_heads, head_size, block_size]
-  const float k_scale,
-  const float v_scale,
+  const float* __restrict__ k_scales,
+  const float* __restrict__ v_scales,
   const int num_kv_heads,                 // [num_heads]
   const float scale,
   const int32_t* __restrict__ block_tables,   // [num_seqs, max_num_blocks_per_seq]
@@ -515,7 +514,7 @@ __global__ void paged_attention_v2_kernel(
     #endif
   }
   paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, PARTITION_SIZE>(
-    exp_sums, max_logits, tmp_out, q, k_cache, v_cache, k_scale, v_scale, num_kv_heads, scale,
+    exp_sums, max_logits, tmp_out, q, k_cache, v_cache, k_scales, v_scales, num_kv_heads, scale,
     block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes,
     q_stride, kv_block_stride, kv_head_stride, softscapping);
 }
