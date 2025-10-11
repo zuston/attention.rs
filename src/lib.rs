@@ -1,16 +1,17 @@
 pub mod paged_attention;
-pub mod scale_collector;
+pub mod scale_update;
 use candle_core::{Device, Result, Tensor};
 use paged_attention::{paged_attention, reshape_and_cache};
-use parking_lot::RwLock;
-use scale_collector::KvScaleCalculator;
-use std::sync::Arc;
+use scale_update::kv_scale_update;
 #[cfg(feature = "cuda")]
 pub mod sort;
 #[cfg(feature = "cuda")]
 pub use kernels;
 #[cfg(feature = "metal")]
 pub use metal_kernels;
+
+const KV_SCALE_UPDATE_ITERATION: i32 = 128;
+use std::sync::atomic::{AtomicI32, Ordering};
 pub struct InputMetadata {
     pub is_prefill: bool,
     pub slot_mapping: Tensor,
@@ -32,7 +33,9 @@ pub struct PagedAttention {
     sliding_window: Option<usize>,
     num_queries_per_kv: usize,
     alibi_slopes: Option<Tensor>,
-    collector: Option<Arc<RwLock<KvScaleCalculator>>>,
+    k_scale: Option<Tensor>,
+    v_scale: Option<Tensor>,
+    kv_updated_times: AtomicI32,
 }
 
 impl PagedAttention {
@@ -61,11 +64,17 @@ impl PagedAttention {
             sliding_window,
             num_queries_per_kv,
             alibi_slopes,
-            collector: if fp8_kvcache {
-                Some(Arc::new(RwLock::new(KvScaleCalculator::new(&device)?)))
+            k_scale: if fp8_kvcache {
+                Some(Tensor::new(1f32, &device)?)
             } else {
                 None
             },
+            v_scale: if fp8_kvcache {
+                Some(Tensor::new(1f32, &device)?)
+            } else {
+                None
+            },
+            kv_updated_times: AtomicI32::new(0),
         })
     }
 
@@ -241,38 +250,12 @@ impl PagedAttention {
         input_metadata: &InputMetadata,
         softcapping: Option<f64>,
     ) -> Result<Tensor> {
-        if let Some(collector) = &self.collector {
-            let mut c = collector.write();
-            if let KvScaleCalculator::InProgress {
-                k_scale: _,
-                v_scale: _,
-                n: _,
-            } = c.clone()
-            {
-                let k_scale = KvScaleCalculator::compute_scale(&key)?;
-                let v_scale = KvScaleCalculator::compute_scale(&value)?;
-                let n = c.collect(&k_scale, &v_scale)?;
-
-                if n == 100 {
-                    c.finish()?;
-                    assert!(matches!(*c, KvScaleCalculator::Done { .. }));
-                }
+        if let (Some(k_scale), Some(v_scale)) = (&self.k_scale, &self.v_scale) {
+            if self.kv_updated_times.load(Ordering::Relaxed) < KV_SCALE_UPDATE_ITERATION {
+                kv_scale_update(key, value, k_scale, v_scale)?;
+                self.kv_updated_times.fetch_add(1, Ordering::Relaxed);
             }
         }
-
-        let (k_scales, v_scales) = if let Some(collector) = &self.collector {
-            let c = collector.read();
-            match c.clone() {
-                KvScaleCalculator::Done { k_scale, v_scale } => (Some(k_scale), Some(v_scale)),
-                KvScaleCalculator::InProgress {
-                    k_scale,
-                    v_scale,
-                    n: _,
-                } => (Some(k_scale), Some(v_scale)),
-            }
-        } else {
-            (None, None)
-        };
 
         let dims = input_metadata.slot_mapping.dims();
         let slot_mapping = if dims.len() > 1 {
@@ -314,8 +297,8 @@ impl PagedAttention {
                 &value,
                 key_cache.as_ref().unwrap(),
                 value_cache.as_ref().unwrap(),
-                k_scales.as_ref(),
-                v_scales.as_ref(),
+                self.k_scale.as_ref(),
+                self.v_scale.as_ref(),
                 &slot_mapping,
             )?;
 
@@ -394,8 +377,8 @@ impl PagedAttention {
             &query,
             key_cache.as_ref().unwrap(),
             value_cache.as_ref().unwrap(),
-            k_scales.as_ref(),
-            v_scales.as_ref(),
+            self.k_scale.as_ref(),
+            self.v_scale.as_ref(),
             block_tables,
             context_lens,
             None,
