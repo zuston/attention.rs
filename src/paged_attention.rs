@@ -893,8 +893,8 @@ impl ReshapeCache {
             #[cfg(feature = "flash-decoding")]
             {
                 assert!(
-                    !k_scales_ptr.is_null() && !v_scales_ptr.is_null(),
-                    "fp8 kvcache is not supported under flash attention!"
+                    k_scales_ptr.is_null() && v_scales_ptr.is_null(),
+                    "fp8 kvcache is not supported under flash context!"
                 );
                 let block_stride = kc_l.stride()[0];
                 let page_stride = kc_l.stride()[1];
