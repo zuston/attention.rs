@@ -3,7 +3,6 @@ pub mod scale_update;
 use candle_core::{Device, Result, Tensor};
 use paged_attention::{paged_attention, reshape_and_cache};
 use scale_update::kv_scale_update;
-#[cfg(feature = "cuda")]
 pub mod mask;
 #[cfg(feature = "cuda")]
 pub mod sort;

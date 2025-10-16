@@ -944,3 +944,57 @@ pub fn paged_attention_prefill(
 fn size_of_val<T>(val: &T) -> u64 {
     core::mem::size_of_val(val) as u64
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_causal_mask(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: PagedAttentionDType,
+    out: &Buffer,
+    tgt_len: i32,
+    sliding_window: i32,
+) -> Result<(), MetalKernelError> {
+    // Determine the kernel name based on the type
+    let name = match ty {
+        PagedAttentionDType::F32 => "causal_mask_float",
+        PagedAttentionDType::BF16 => "causal_mask_bfloat16_t",
+        PagedAttentionDType::F16 => "causal_mask_half",
+    };
+
+    // Load the compute pipeline for the selected type
+    let pipeline = kernels.load_pipeline(device, name.to_string())?;
+
+    // Get the encoder and cast it to the appropriate type
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    // Set the parameters for the kernel
+    set_params!(
+        encoder,
+        (
+            (out, 0),       // Output buffer
+            tgt_len,        // Target length (size)
+            sliding_window  // Sliding window size
+        )
+    );
+
+    // Set up the number of thread groups and threads per group
+    let thread_groups_count = MTLSize {
+        width: tgt_len as u64,
+        height: 1,
+        depth: 1,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 256, // Use a reasonable number of threads per threadgroup
+        height: 1,
+        depth: 1,
+    };
+
+    // Dispatch the kernel
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+
+    // Commit the encoder to launch the kernel
+    Ok(())
+}
