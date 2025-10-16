@@ -737,6 +737,8 @@ inline void from_float(thread Half8_& dst, Float8_ src) {
   dst.y = y;
 }
 
+#define MIN_FP8_VALUE (-447.0f) // -max representable normal fp8 E4M3
+#define MAX_FP8_VALUE (447.0f)  // max representable normal fp8 E4M3
 
 // FP8 E4M3 conversion
 static inline uint as_bits(float x) { return as_type<uint>(x); }
@@ -767,59 +769,159 @@ inline float softmax_fp8_to_float(uint8_t v) {
   return s ? -val : val;
 }
 
-
 inline uint8_t float_to_softmax_fp8(float f) {
-  const int EXP_BITS = 4;
-  const int MAN_BITS = 3;
-  const int BIAS = 7;
+  // bit-level access
+  uint bits = as_bits(f);
+  int sign = (bits >> 31) & 1;
+  int exp = (bits >> 23) & 0xFF;
+  uint mant = bits & 0x7FFFFF;
 
-  const uint bits = as_bits(f);
-  const uint s = bits >> 31;
-  const uint abs = bits & 0x7FFFFFFF;
-
-  // NaN propagates, Inf saturates
-  if (abs >= 0x7F800000u) {
-    return uchar((s << 7) | (((1u << EXP_BITS) - 1u) << MAN_BITS) |
-                 (abs != 0x7F800000u));
-  }
-
-  int e = int((abs >> 23) & 0xFF) - 127;   // unbiased exponent
-  uint m = abs & 0x7FFFFFu;                // 23-bit mantissa
-  const int EXP_MAX = (1 << EXP_BITS) - 2; // last finite exponent
-
-  // ---------- Normal path -------------------------------------------------
-  int e_fp8 = e + BIAS;
-  if (e_fp8 >= 1 && e_fp8 <= EXP_MAX) {
-    // round-to-nearest-even
-    const int shift = 23 - MAN_BITS;
-    uint mant = m >> shift;
-    const uint lsb = mant & 1u;
-    const uint round = (m >> (shift - 1)) & 1u;
-    const uint sticky = (m & ((1u << (shift - 1)) - 1u)) != 0u;
-    mant += (round & (sticky | lsb));
-    if (mant >> MAN_BITS) { // mantissa overflow
-      mant = 0;
-      ++e_fp8;
-      if (e_fp8 > EXP_MAX)
-        return uchar((s << 7) | (((1u << EXP_BITS) - 1u) << MAN_BITS)); // ∞
+  // special cases
+  if (exp == 0xFF) { // Inf or NaN
+    if (mant != 0) {
+      // produce a quiet NaN: sign=0, exp=1111, mant != 0
+      return (uchar)((0 << 7) | (0xF << 3) | 1);
+    } else {
+      // Inf
+      return (uchar)((sign << 7) | (0xF << 3) | 0);
     }
-    return uchar((s << 7) | (uint(e_fp8) << MAN_BITS) |
-                 (mant & ((1u << MAN_BITS) - 1u)));
   }
 
-  // ---------- Sub-normal / under-flow ------------------------------------
-  if (e_fp8 < 1 - MAN_BITS) // too small -> ±0
-    return uchar(s << 7);
+  // zero
+  if (exp == 0 && mant == 0) {
+    return (uchar)(sign << 7);
+  }
 
-  // shift so that exponent becomes 1
-  int rshift = (1 - e_fp8) + (23 - MAN_BITS);
-  uint mant = (0x800000u | m); // implicit 1
-  uint rounded = (mant + (1u << (rshift - 1))) >> rshift;
-  if (rounded == 0)
-    return uchar(s << 7); // rounds to zero
+  // normalized float: compute new exponent with bias differences
+  const int FP32_BIAS = 127;
+  const int FP8_BIAS = 7;
+  int new_exp = exp - FP32_BIAS + FP8_BIAS;
 
-  return uchar((s << 7) | (rounded & ((1u << MAN_BITS) - 1u)));
+  // Prepare mantissa including hidden 1 for normals
+  uint mant_with_hidden = mant;
+  if (exp != 0) {
+    mant_with_hidden |= (1u << 23);
+  } else {
+    // subnormal float -- handled below
+  }
+
+  // Overflow -> set to Inf
+  if (new_exp >= 0xF) {
+    return (uchar)((sign << 7) | (0xF << 3)); // Inf
+  }
+
+  // Underflow -> could become subnormal or zero in FP8
+  if (new_exp <= 0) {
+    // shift needed to form subnormal in FP8
+    // effective shift: number of bits to right-shift mantissa to align to 3-bit mantissa
+    int shift = (1 - new_exp) + (23 - 3); // (1-new_exp) accounts for denorm scaling
+    if (shift >= 32) {
+      // too small -> underflow to zero
+      return (uchar)(sign << 7);
+    }
+    // build a rounding window
+    uint abs_mant = mant_with_hidden;
+    // Round-to-nearest-even for subnormal:
+    uint truncated = abs_mant >> shift;
+    uint remainder = abs_mant & ((1u << shift) - 1u);
+
+    // rounding decision: look at the highest discarded bit and lower bits
+    uint halfs = 1u << (shift - 1);
+    if ( (remainder > halfs) || (remainder == halfs && (truncated & 1u)) ) {
+      truncated += 1u;
+    }
+
+    // truncated now contains the 3-bit (or fewer) significand; clamp to 3 bits
+    uint mant8 = truncated & 0x7u;
+    if (mant8 == 0) {
+      // rounds to zero
+      return (uint8_t)(sign << 7);
+    } else {
+      // exp = 0 (subnormal)
+      return (uint8_t)((sign << 7) | (0 << 3) | (mant8));
+    }
+  }
+
+  // Normal case: need to round mantissa to 3 bits
+  // shift mantissa (23 -> 3): keep top 3 bits of mant_with_hidden (which has 24 bits)
+  int shift_norm = 23 - 3;
+  uint truncated = (mant_with_hidden >> shift_norm) & 0x7u; // 3 bits
+  // gather bits used for rounding
+  uint round_bit_pos = shift_norm - 1;
+  uint round_bit = (mant_with_hidden >> round_bit_pos) & 1u;
+  uint sticky_mask = (1u << round_bit_pos) - 1u;
+  uint sticky = (mant_with_hidden & sticky_mask) ? 1u : 0u;
+
+  // Round-to-nearest-even
+  if (round_bit && (sticky || (truncated & 1u))) {
+    truncated += 1u;
+    if (truncated == (1u << 3)) {
+      // mantissa overflow -> increment exponent
+      truncated = 0;
+      new_exp += 1;
+      if (new_exp >= 0xF) {
+        // overflow to Inf
+        return (uchar)((sign << 7) | (0xF << 3));
+      }
+    }
+  }
+
+  uchar out = (uchar)((sign << 7) | ((new_exp & 0xF) << 3) | (truncated & 0x7));
+  return out;
 }
+
+// inline uint8_t float_to_softmax_fp8(float f) {
+//   const int EXP_BITS = 4;
+//   const int MAN_BITS = 3;
+//   const int BIAS = 7;
+
+//   const uint bits = as_bits(f);
+//   const uint s = bits >> 31;
+//   const uint abs = bits & 0x7FFFFFFF;
+
+//   // NaN propagates, Inf saturates
+//   if (abs >= 0x7F800000u) {
+//     return uchar((s << 7) | (((1u << EXP_BITS) - 1u) << MAN_BITS) |
+//                  (abs != 0x7F800000u));
+//   }
+
+//   int e = int((abs >> 23) & 0xFF) - 127;   // unbiased exponent
+//   uint m = abs & 0x7FFFFFu;                // 23-bit mantissa
+//   const int EXP_MAX = (1 << EXP_BITS) - 2; // last finite exponent
+
+//   // ---------- Normal path -------------------------------------------------
+//   int e_fp8 = e + BIAS;
+//   if (e_fp8 >= 1 && e_fp8 <= EXP_MAX) {
+//     // round-to-nearest-even
+//     const int shift = 23 - MAN_BITS;
+//     uint mant = m >> shift;
+//     const uint lsb = mant & 1u;
+//     const uint round = (m >> (shift - 1)) & 1u;
+//     const uint sticky = (m & ((1u << (shift - 1)) - 1u)) != 0u;
+//     mant += (round & (sticky | lsb));
+//     if (mant >> MAN_BITS) { // mantissa overflow
+//       mant = 0;
+//       ++e_fp8;
+//       if (e_fp8 > EXP_MAX)
+//         return uchar((s << 7) | (((1u << EXP_BITS) - 1u) << MAN_BITS)); // ∞
+//     }
+//     return uchar((s << 7) | (uint(e_fp8) << MAN_BITS) |
+//                  (mant & ((1u << MAN_BITS) - 1u)));
+//   }
+
+//   // ---------- Sub-normal / under-flow ------------------------------------
+//   if (e_fp8 < 1 - MAN_BITS) // too small -> ±0
+//     return uchar(s << 7);
+
+//   // shift so that exponent becomes 1
+//   int rshift = (1 - e_fp8) + (23 - MAN_BITS);
+//   uint mant = (0x800000u | m); // implicit 1
+//   uint rounded = (mant + (1u << (rshift - 1))) >> rshift;
+//   if (rounded == 0)
+//     return uchar(s << 7); // rounds to zero
+
+//   return uchar((s << 7) | (rounded & ((1u << MAN_BITS) - 1u)));
+// }
 
 
 template<>
@@ -975,7 +1077,7 @@ inline Float8_ scaled_vec_conversion<Float8_, uint2>(
 template <>
 inline uint8_t scaled_vec_conversion<uint8_t, half>(
     half a, float scale) {
-  float f = static_cast<float>(a) / scale;
+  float f = fmin(fmax(static_cast<float>(a) / scale, MIN_FP8_VALUE), MAX_FP8_VALUE);
   return float_to_softmax_fp8(f);
 }
 
@@ -983,7 +1085,7 @@ inline uint8_t scaled_vec_conversion<uint8_t, half>(
 template <>
 inline uint8_t scaled_vec_conversion<uint8_t, bfloat16_t>(
     bfloat16_t a, float scale) {
-  float f = static_cast<float>(a) / scale;
+  float f = fmin(fmax(static_cast<float>(a) / scale, MIN_FP8_VALUE), MAX_FP8_VALUE);
   return float_to_softmax_fp8(f);
 }
 
@@ -991,7 +1093,7 @@ inline uint8_t scaled_vec_conversion<uint8_t, bfloat16_t>(
 template <>
 inline uint8_t scaled_vec_conversion<uint8_t, float>(
     float a, float scale) {
-  float f = a / scale;
+  float f = fmin(fmax(a / scale, MIN_FP8_VALUE), MAX_FP8_VALUE);
   return float_to_softmax_fp8(f);
 }
 

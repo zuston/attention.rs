@@ -15,8 +15,8 @@ template<typename T, typename cache_t, bool is_quantized>
     device const int& head_size,
     device const int& block_size,
     device const int& x,
-    device const float& k_scale,
-    device const float& v_scale,
+    device const float* k_scales,
+    device const float* v_scales,
     uint gid [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint threads_per_threadgroup [[threads_per_threadgroup]]
@@ -27,6 +27,8 @@ template<typename T, typename cache_t, bool is_quantized>
     // Padding token that should be ignored.
     return;
   }
+  float k_scale = is_quantized ? k_scales[0] : 1.0;
+  float v_scale = is_quantized ? v_scales[0] : 1.0;
 
   const int64_t block_idx = slot_idx / block_size;
   const int64_t block_offset = slot_idx % block_size;
@@ -74,8 +76,8 @@ template<typename T, typename cache_t, bool is_quantized>
     device const int& head_size,                  \
     device const int& block_size,                  \
     device const int& x,                  \
-    device const float& k_scale,                  \
-    device const float& v_scale,                  \
+    device const float* k_scales,                  \
+    device const float* v_scales,                  \
     uint gid [[threadgroup_position_in_grid]],                  \
     uint tid [[thread_position_in_threadgroup]],                  \
     uint threads_per_threadgroup [[threads_per_threadgroup]]);

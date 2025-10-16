@@ -1,4 +1,5 @@
 use candle_core as candle;
+use candle_core::backend::BackendStorage;
 use candle_core::{DType, Result, Tensor};
 #[cfg(feature = "cuda")]
 use kernels::ffi;
@@ -106,6 +107,55 @@ impl candle::InplaceOp2 for KvScaleUpdate {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        k: &mut candle_core::MetalStorage,
+        k_l: &candle_core::Layout,
+        v: &candle::MetalStorage,
+        _: &candle::Layout,
+    ) -> Result<()> {
+        let dtype = k.dtype();
+        let internal_type = match dtype {
+            DType::F16 => metal_kernels::PagedAttentionDType::F16,
+            DType::BF16 => metal_kernels::PagedAttentionDType::BF16,
+            DType::F32 => metal_kernels::PagedAttentionDType::F32,
+            dtype => candle_core::bail!("dtype {dtype:?} is not supported"),
+        };
+        let elem_count = k_l.shape().elem_count();
+
+        let dev = k.device();
+        let (k_scales, _) = self.k_scales.storage_and_layout();
+        let k_scales = match &*k_scales {
+            candle::Storage::Metal(c) => c,
+            _ => candle::bail!("k_scales must be a metal tensor"),
+        };
+
+        let (v_scales, _) = self.v_scales.storage_and_layout();
+        let v_scales = match &*v_scales {
+            candle::Storage::Metal(c) => c,
+            _ => candle::bail!("v_scales must be a metal tensor"),
+        };
+
+        let command_buffer = dev.command_buffer()?;
+        command_buffer.set_label("update-scales");
+
+        metal_kernels::call_update_scales(
+            dev.device(),
+            &command_buffer,
+            metal_kernels::Kernels::default(),
+            internal_type,
+            k.buffer(),
+            v.buffer(),
+            elem_count as i64,
+            k_scales.buffer(),
+            v_scales.buffer(),
+        )
+        .map_err(candle_core::Error::wrap)?;
+
         Ok(())
     }
 }

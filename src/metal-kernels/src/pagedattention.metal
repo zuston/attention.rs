@@ -96,8 +96,8 @@ template <typename T, typename cache_t, bool is_quantized, int HEAD_SIZE, int BL
     const constant int& q_stride [[buffer(13)]],
     const constant int& kv_block_stride [[buffer(14)]],
     const constant int& kv_head_stride [[buffer(15)]],
-    const constant float& k_scale [[buffer(16)]],
-    const constant float& v_scale [[buffer(17)]],
+    device const float* k_scales [[buffer(16)]],
+    device const float* v_scales [[buffer(17)]],
     threadgroup char* shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -115,6 +115,8 @@ template <typename T, typename cache_t, bool is_quantized, int HEAD_SIZE, int BL
     // No work to do. Terminate the thread block.
     return;
   }
+  float k_scale = is_quantized ? k_scales[0] : 1.0;
+  float v_scale = is_quantized ? v_scales[0] : 1.0;
 
   const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE);
   const int num_blocks_per_partition = USE_PARTITIONING ? PARTITION_SIZE / BLOCK_SIZE : num_context_blocks;
@@ -536,8 +538,8 @@ template <typename T, typename cache_t, int HEAD_SIZE, int NUM_THREADS, int NUM_
       const constant int& q_stride [[buffer(13)]],                                            \
       const constant int& kv_block_stride [[buffer(14)]],                                            \
       const constant int& kv_head_stride [[buffer(15)]],                                            \
-      const constant float& k_scale [[buffer(16)]],                                            \
-      const constant float& v_scale [[buffer(17)]],                                            \
+      device const float* k_scales [[buffer(16)]],                                            \
+      device const float* v_scales [[buffer(17)]],                                            \
       threadgroup char* shared_mem [[threadgroup(0)]],                                            \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],                                            \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                                            \

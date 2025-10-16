@@ -1,3 +1,4 @@
+use candle_core::MetalStorage;
 use metal::{Buffer, ComputeCommandEncoderRef};
 use std::ffi::c_void;
 
@@ -74,6 +75,14 @@ impl EncoderParam for &mut Buffer {
 impl EncoderParam for (&mut Buffer, usize) {
     fn set_param(encoder: &ComputeCommandEncoderRef, position: u64, data: Self) {
         encoder.set_buffer(position, Some(data.0), data.1 as u64);
+    }
+}
+
+impl EncoderParam for Option<MetalStorage> {
+    fn set_param(encoder: &ComputeCommandEncoderRef, position: u64, data: Self) {
+        if let Some(s) = data {
+            encoder.set_buffer(position, Some(s.buffer()), 0);
+        }
     }
 }
 

@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::{env, str};
-const METAL_SOURCES: [&str; 5] = [
+const METAL_SOURCES: [&str; 6] = [
     "copy_blocks",
     "pagedattention",
     "reshape_and_cache",
     "prefill_paged_attn",
     "mask",
+    "update_scales",
 ];
 
 enum Platform {

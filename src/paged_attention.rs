@@ -453,6 +453,24 @@ impl PagedAttention {
                 (num_seqs)
             )
         }
+        let (k_scale, v_scale) =
+            if let (Some(k_scales), Some(v_scales)) = (&self.k_scales, &self.v_scales) {
+                let (k_scales, _) = k_scales.storage_and_layout();
+                let k_scales = match &*k_scales {
+                    candle::Storage::Metal(c) => c,
+                    _ => candle::bail!("k_scales must be a metal tensor"),
+                };
+
+                let (v_scales, _) = v_scales.storage_and_layout();
+                let v_scales = match &*v_scales {
+                    candle::Storage::Metal(c) => c,
+                    _ => candle::bail!("v_scales must be a metal tensor"),
+                };
+
+                (Some(k_scales.clone()), Some(v_scales.clone()))
+            } else {
+                (None, None)
+            };
 
         let q_stride = q_l.stride()[0];
         let kv_block_stride = kc_l.stride()[0];
@@ -548,8 +566,8 @@ impl PagedAttention {
                 q_stride as i32,
                 kv_block_stride as i32,
                 kv_head_stride as i32,
-                1.0f32,
-                1.0f32,
+                k_scale,
+                v_scale,
             )
             .map_err(candle_core::Error::wrap)?;
         } else {
@@ -600,8 +618,8 @@ impl PagedAttention {
                 q_stride as i32,
                 kv_block_stride as i32,
                 kv_head_stride as i32,
-                1.0f32,
-                1.0f32,
+                k_scale,
+                v_scale,
             )
             .map_err(candle_core::Error::wrap)?;
         }
@@ -1046,6 +1064,25 @@ impl ReshapeCache {
         let key_stride = k_l.stride()[0] as i32;
         let value_stride = v_l.stride()[0] as i32;
 
+        let (k_scale, v_scale) =
+            if let (Some(k_scales), Some(v_scales)) = (&self.k_scales, &self.v_scales) {
+                let (k_scales, _) = k_scales.storage_and_layout();
+                let k_scales = match &*k_scales {
+                    candle::Storage::Metal(c) => c,
+                    _ => candle::bail!("k_scales must be a metal tensor"),
+                };
+
+                let (v_scales, _) = v_scales.storage_and_layout();
+                let v_scales = match &*v_scales {
+                    candle::Storage::Metal(c) => c,
+                    _ => candle::bail!("v_scales must be a metal tensor"),
+                };
+
+                (Some(k_scales.clone()), Some(v_scales.clone()))
+            } else {
+                (None, None)
+            };
+
         let dev = k.device();
 
         let command_buffer = dev.command_buffer()?;
@@ -1073,8 +1110,8 @@ impl ReshapeCache {
             x as i32,
             key_stride,
             value_stride,
-            1.0f32,
-            1.0f32,
+            k_scale,
+            v_scale,
         )
         .map_err(candle_core::Error::wrap)?;
 

@@ -210,10 +210,10 @@ pub fn call_reshape_and_cache(
     x: i32,
     key_stride: i32,
     value_stride: i32,
-    k_scale: f32,
-    v_scale: f32,
+    k_scale: Option<MetalStorage>,
+    v_scale: Option<MetalStorage>,
 ) -> Result<(), MetalKernelError> {
-    let quantized_cache = k_scale != 1.0f32 && v_scale != 1.0f32;
+    let quantized_cache = k_scale.is_some() && v_scale.is_some();
     let name = match ty {
         PagedAttentionDType::F32 => {
             if quantized_cache {
@@ -355,12 +355,12 @@ pub fn paged_attention_v1(
     q_stride: i32,
     kv_block_stride: i32,
     kv_head_stride: i32,
-    k_scale: f32,
-    v_scale: f32,
+    k_scale: Option<MetalStorage>,
+    v_scale: Option<MetalStorage>,
 ) -> Result<(), MetalKernelError> {
     const NUM_THREADS: u64 = 256;
     const NUM_SIMD_LANES: u64 = 32;
-    let quantized_cache = k_scale != 1.0f32 && v_scale != 1.0f32;
+    let quantized_cache = k_scale.is_some() && v_scale.is_some();
 
     let name = match ty {
         PagedAttentionDType::F32 => {
@@ -462,16 +462,13 @@ pub fn paged_attention_v1(
         &kv_head_stride as *const _ as *const c_void,
     );
 
-    encoder.set_bytes(
-        16,
-        core::mem::size_of_val(&k_scale) as u64,
-        &k_scale as *const _ as *const c_void,
-    );
-    encoder.set_bytes(
-        17,
-        core::mem::size_of_val(&v_scale) as u64,
-        &v_scale as *const _ as *const c_void,
-    );
+    if let Some(k_scale) = k_scale {
+        encoder.set_buffer(16, Some(k_scale.buffer()), 0);
+    }
+
+    if let Some(v_scale) = v_scale {
+        encoder.set_buffer(17, Some(v_scale.buffer()), 0);
+    }
 
     let thread_groups_count = MTLSize {
         width: num_heads as u64,
@@ -520,13 +517,13 @@ pub fn paged_attention_v2(
     q_stride: i32,
     kv_block_stride: i32,
     kv_head_stride: i32,
-    k_scale: f32,
-    v_scale: f32,
+    k_scale: Option<MetalStorage>,
+    v_scale: Option<MetalStorage>,
 ) -> Result<(), MetalKernelError> {
     const NUM_THREADS: u64 = 256;
     const PARTITION_SIZE: u64 = 512;
     const NUM_SIMD_LANES: u64 = 32;
-    let quantized_cache = k_scale != 1.0f32 && v_scale != 1.0f32;
+    let quantized_cache = k_scale.is_some() && v_scale.is_some();
     // Initial paged attention kernel
     {
         let name = match ty {
@@ -633,16 +630,13 @@ pub fn paged_attention_v2(
             &kv_head_stride as *const _ as *const c_void,
         );
 
-        encoder.set_bytes(
-            16,
-            core::mem::size_of_val(&k_scale) as u64,
-            &k_scale as *const _ as *const c_void,
-        );
-        encoder.set_bytes(
-            17,
-            core::mem::size_of_val(&v_scale) as u64,
-            &v_scale as *const _ as *const c_void,
-        );
+        if let Some(k_scale) = k_scale {
+            encoder.set_buffer(16, Some(k_scale.buffer()), 0);
+        }
+
+        if let Some(v_scale) = v_scale {
+            encoder.set_buffer(17, Some(v_scale.buffer()), 0);
+        }
 
         let thread_groups_count = MTLSize {
             width: num_heads as u64,
@@ -996,5 +990,57 @@ pub fn call_causal_mask(
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
 
     // Commit the encoder to launch the kernel
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_update_scales(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: PagedAttentionDType,
+    k: &Buffer,
+    v: &Buffer,
+    num_elements: i64,
+    k_scales: &Buffer,
+    v_scales: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let name = match ty {
+        PagedAttentionDType::F32 => "compute_and_update_scales_float",
+        PagedAttentionDType::BF16 => "compute_and_update_scales_bfloat16_t",
+        PagedAttentionDType::F16 => "compute_and_update_scales_half",
+    };
+
+    let pipeline = kernels.load_pipeline(device, name.to_string())?;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    // Set the parameters
+    set_params!(
+        encoder,
+        (
+            (k, 0),        // k buffer
+            (v, 0),        // v buffer
+            num_elements,  // total number of elements
+            (k_scales, 0), // k scale
+            (v_scales, 0)  // v scale
+        )
+    );
+
+    // Dispatch the kernel
+    let thread_groups_count = MTLSize {
+        width: (num_elements as u64 + 511) / 512,
+        height: 1,
+        depth: 1,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 512,
+        height: 1,
+        depth: 1,
+    };
+
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
 }
