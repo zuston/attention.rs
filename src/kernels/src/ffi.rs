@@ -393,4 +393,8 @@ extern "C" {
         inplace: bool,
         stream: i64,
     );
+
+    pub fn causal_mask_f32(d_out: *mut c_void, tgt_len: i32, sliding_window: i32, stream: i64);
+    pub fn causal_mask_f16(d_out: *mut c_void, tgt_len: i32, sliding_window: i32, stream: i64);
+    pub fn causal_mask_bf16(d_out: *mut c_void, tgt_len: i32, sliding_window: i32, stream: i64);
 }

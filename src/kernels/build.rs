@@ -9,6 +9,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/reshape_and_cache_kernel.cu");
     println!("cargo:rerun-if-changed=src/sort.cu");
     println!("cargo:rerun-if-changed=src/update_kvscales.cu");
+    println!("cargo:rerun-if-changed=src/mask.cu");
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
     let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap_or("".to_string()));
