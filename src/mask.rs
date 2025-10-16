@@ -57,7 +57,7 @@ impl candle::InplaceOp1 for CausalMask {
                     self.sliding_window as i32,
                     stream,
                 ),
-                DType::BF16 => ffi::causal_mask_f16(
+                DType::BF16 => ffi::causal_mask_bf16(
                     src_ptr,
                     tgt_len as i32,
                     self.sliding_window as i32,
