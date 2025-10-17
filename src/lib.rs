@@ -6,6 +6,7 @@ use scale_update::kv_scale_update;
 pub mod mask;
 #[cfg(feature = "cuda")]
 pub mod sort;
+pub mod topk;
 #[cfg(feature = "cuda")]
 pub use kernels;
 #[cfg(feature = "metal")]

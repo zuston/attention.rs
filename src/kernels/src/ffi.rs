@@ -397,4 +397,15 @@ extern "C" {
     pub fn causal_mask_f32(d_out: *mut c_void, tgt_len: i32, sliding_window: i32, stream: i64);
     pub fn causal_mask_f16(d_out: *mut c_void, tgt_len: i32, sliding_window: i32, stream: i64);
     pub fn causal_mask_bf16(d_out: *mut c_void, tgt_len: i32, sliding_window: i32, stream: i64);
+
+    pub fn topk_softmax(
+        gating_output: *const f32,        // in： [num_tokens, num_experts]
+        token_expert_indices: *const i32, // out: [num_tokens, topk]
+        topk_weights: *const f32,         // out: [num_tokens, topk]
+        topk_indices: *const u32,         // out: [num_tokens, topk]
+        num_experts: i32,
+        num_tokens: i32,
+        topk: i32,
+        stream: i64,
+    );
 }

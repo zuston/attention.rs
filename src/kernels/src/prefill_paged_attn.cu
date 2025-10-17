@@ -200,10 +200,6 @@ __global__ void chunked_prefill_paged_attention_kernel(
     K_vec k_vec[NUM_VECS];
     float qk_block[BLOCK_SIZE];
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-    scalar_t zero_value;
-    zero(zero_value);
-#endif
     // Determine active head and token
     const int query_head_idx = kv_head_idx * num_queries_per_kv + qh_base_idx;
     const bool head_active = (qh_base_idx < num_queries_per_kv) && (query_head_idx < num_query_heads);
