@@ -1,6 +1,7 @@
 #[cfg(feature = "metal")]
 use candle::MetalStorage;
 use candle_core as candle;
+#[allow(unused_imports)]
 use candle_core::backend::BackendStorage;
 use candle_core::{DType, Result, Tensor};
 #[cfg(feature = "cuda")]

@@ -236,21 +236,12 @@ __global__ void chunked_prefill_paged_attention_kernel(
             ((uint64_t)physical_block < (uint64_t)total_num_blocks);
 
         const int block_in_full = blk * BLOCK_SIZE;
-        bool block_in_context = block_in_full < (int)seq_len_full;
-        if (block_in_context && sliding_window > 0) {
-            if (blk > 2 &&  (context_len - block_in_full - BLOCK_SIZE) >= sliding_window) continue;
-        }
 
         // --- Compute q·k for each token in this block ---
         bool in_contexts[BLOCK_SIZE] = { false };
         for (int b = 0; b < BLOCK_SIZE; ++b) {
             const int token_idx_in_full = block_in_full + b;
             bool in_context = token_idx_in_full < (int)seq_len_full;
-             // Apply sliding window constraint
-            if (in_context && sliding_window > 0) {
-                //the first few blocks has important info, we don't want lose it
-                if (blk > 2 && (context_len - token_idx_in_full) >= sliding_window) in_context = false;
-            }
             in_contexts[b] = in_context;
 
             if (!in_context || !valid_block || !lane_active) {
@@ -259,12 +250,12 @@ __global__ void chunked_prefill_paged_attention_kernel(
             }
              // Load K vector from kcache
             // #pragma unroll
+            const int offset = physical_block * kv_block_stride + kv_head_idx * kv_head_stride;
             for (int k = 0; k < NUM_VECS; k++) {
               int d = k * VEC_SIZE;
               int gy = d / X;
-              int64_t k_idx = physical_block * kv_block_stride + kv_head_idx * kv_head_stride +
-                              gy * (BLOCK_SIZE * X) + b * X;
-              
+              int gx = d % X;
+              int64_t k_idx = offset + b * X + gy * (BLOCK_SIZE * X) + gx;
               if constexpr (!is_quantized) {
                 k_vec[k] = *reinterpret_cast<const K_vec*>(&k_cache[k_idx]);
               } else {
