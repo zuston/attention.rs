@@ -9,6 +9,7 @@
 This project is a collection of high-performance **paged attention** implementations optimized for **large language model (LLM) inference**, supporting:
 
 - ✅ **Paged Attention** (GPU/Metal-accelerated, memory-efficient key-value caching)
+- ✅ **Fused MoE** WWMA fused MoE kernel for prefill and tiling based one for decoding
 - ✅ **Chunked Prefill** for long sequences (prefill attention with kvcache, enabling `context cache` and chunked prefill)
 - ✅ **Cross-platform**: CUDA (NVIDIA GPUs, `V100`, A100, H100, etc.) & Metal (Apple Silicon M1/M2/M3/M4)
 - ✅ **Flexible API-first design** with clean, reusable attention operations

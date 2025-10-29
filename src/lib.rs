@@ -1,3 +1,4 @@
+pub mod moe;
 pub mod paged_attention;
 pub mod scale_update;
 use candle_core::{Device, Result, Tensor};
