@@ -1,28 +1,24 @@
 /**
- * @brief WMMA-based CUDA kernel for Mixture-of-Experts (MoE) GEMM with tiling and output masking.
- * Copyright (c) 2025, Guoqing Bao.  All rights reserved.
+ *  @brief  WMMA-based grouped MoE GEMM kernel.
  *
- * This kernel performs a matrix multiplication for a segment of tokens routed to the same expert
- * using NVIDIA's Warp Matrix Multiply-Accumulate (WMMA) API. It operates on one contiguous
- * segment of tokens (as grouped by the host) and supports optional top-k gating weights.
+ *  Each block computes a tile of the output corresponding to:
+ *    - One expert segment (group of tokens routed to the same expert)
+ *    - One N-dimension tile (a sub-block of the expert's output features)
+ *
+ *  The kernel loads input activations and expert weights in tiles using shared memory,
+ *  performs matrix multiplication using Tensor Cores (WMMA), and accumulates results
+ *  into a shared C tile. The final results are written atomically into the global
+ *  output buffer to support multi-expert (top-k > 1) routing where tokens appear in
+ *  multiple experts’ outputs.
+ * 
+ * Copyright (c) 2025, Guoqing Bao.  All rights reserved.
  *
  * This CUDA kernel is developed for vLLM.rs project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/moe_gemm_wmma.cu
  *
- * Each CUDA block computes one WMMA tile (16x16) of the output matrix, corresponding to one
- * token segment for a single expert. The kernel efficiently handles partial tiles along the
- * M dimension (i.e., when the segment has fewer than 16 rows) using output masking.
- *
- * @details
- * - Each CUDA block computes a single WMMA tile of size (16 x 16).
- * - BlockDim.x = 32 (one warp per block).
- * - The host launches one kernel per expert segment (i.e., per contiguous group of tokens assigned to an expert).
- * - Shared memory layout (in bytes):
- *      [A_sh (WMMA_M * WMMA_K * sizeof(T))] 
- *      [B_sh_col (WMMA_K * WMMA_N * sizeof(T))] 
- *      [C_sh (WMMA_M * WMMA_N * sizeof(float))]
- * - Shared memory pointers are properly aligned for mixed-precision computation.
- * - Optimized for non-quantized MoE GEMM with K-tiling only.
+ *  @note
+ *   - Uses 4 warps per block (2×2 warp tiling) with block tile = 32×32×16.
+ *   - Shared memory tiles are padded and zeroed for tail handling.
  *
  * @note: this wwma MoE kernel is only used for prefill not compatible with cuda graph (decoding) 
  * since we requires dynamic host ptr to build expert segments (each segment responsible for a kernel launch)
@@ -69,167 +65,21 @@ inline __device__ float to_float(half u) {
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
+using VecT = float4;
 
-/*
- * @tparam T                   Data type (e.g., half, float) used for computation.
- *
- * @param input                [size_m, size_k] - Input activations for all tokens.
- * @param weights              [num_experts, size_n, size_k] - Expert weight matrices (expert-major layout).
- * @param sorted_token_ids     [size_m] - Indices of tokens sorted by expert assignment.
- * @param topk_weights         [size_m] (optional) - Per-token top-k gating weights (can be nullptr).
- * @param segment_start        Starting index within `sorted_token_ids` for this expert segment.
- * @param num_rows             Number of valid rows (tokens) in this segment (M_i).
- * @param expert_id            Expert ID corresponding to this kernel segment.
- * @param topk                 Number of experts selected per token (top-k routing).
- * @param output               [size_m, size_n] - Output activations for all tokens.
- * @param size_m               Total number of tokens.
- * @param size_n               Output dimension (per expert).
- * @param size_k               Input dimension (per expert).
-*/
-template<typename T>
-__global__ void moe_gemm_wmma_kernel(
-    const T* __restrict__ input,             // [size_m, size_k]
-    const T* __restrict__ weights,           // [num_experts, size_n, size_k]
-    const int32_t* __restrict__ sorted_token_ids, // [size_m]
-    const float* __restrict__ topk_weights,
-    const int32_t segment_start,                // start index (in sorted_token_ids) of this segment
-    const int32_t num_rows,                     // number of valid rows in this segment (M_i)
-    const int32_t expert_id,
-    const int32_t topk,
-    T* __restrict__ output,                 // [size_m, size_n]
-    const int32_t size_m,
-    const int32_t size_n,
-    const int32_t size_k
-) {
-    // tile coordinates
-    const int tile_m_idx = blockIdx.x; // tile index along M within the segment
-    const int tile_n_idx = blockIdx.y; // tile index along N
-    const int laneId = threadIdx.x & 31; // lane within warp
+// Vectorized load size (float4 = 128 bits = 8 half/bfloat16 values)
+constexpr int VEC_SIZE = 8;
+constexpr int NUM_VECS = WMMA_M * WMMA_N / 8;
 
-    const int row_start_in_segment = tile_m_idx * WMMA_M; // 0..num_rows
-    const int col_start = tile_n_idx * WMMA_N;           // 0..size_n
+// We use 4 Warps (128 threads) per block
+constexpr int WARPS_M = 2; // 2 warps along M
+constexpr int WARPS_N = 2; // 2 warps along N
+constexpr int WARPS_PER_BLOCK = WARPS_M * WARPS_N; // 4 warps
+constexpr int BLOCK_THREADS = WARPS_PER_BLOCK * 32; // 128 threads
 
-    if (row_start_in_segment >= num_rows) return;
-    if (col_start >= size_n) return;
-
-    // expert weight base pointer (expert_w[n * size_k + k])
-    const T* expert_w = weights + (size_t)expert_id * (size_t)size_n * (size_t)size_k;
-
-    // Shared memory pointer (bytes). We'll reinterpret as halves & floats appropriately.
-    extern __shared__ uint8_t smem_bytes[]; // allocated by launcher
-    // Layout offsets (in bytes)
-    const size_t A_sh_elems = WMMA_M * WMMA_K; // 256 halves
-    const size_t B_sh_elems = WMMA_K * WMMA_N; // 256 halves
-    const size_t C_sh_elems = WMMA_M * WMMA_N; // 256 floats
-
-    uint8_t* ptr = smem_bytes;
-    T* A_sh = reinterpret_cast<T*>(ptr); // size A_sh_elems
-    ptr += A_sh_elems * 2;
-    T* B_sh_col = reinterpret_cast<T*>(ptr); // size B_sh_elems
-    ptr += B_sh_elems * 2;
-    // align next pointer to float alignment
-    size_t offset = reinterpret_cast<uintptr_t>(ptr) % alignof(float);
-    if (offset != 0) {
-        ptr += (alignof(float) - offset);
-    }
-    float* C_sh = reinterpret_cast<float*>(ptr); // size C_sh_elems
-
-    // Determine valid rows in this tile (1..16)
-    int rows_in_tile = num_rows - row_start_in_segment;
-    if (rows_in_tile > WMMA_M) rows_in_tile = WMMA_M;
-
-    // Number of K-chunks
-    const int K_chunks = CEILDIV(size_k, WMMA_K);
-
-    // accumulator fragment
-    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-    fill_fragment(c_frag, 0.0f);
-
-    T zero_value;
-    vllm::zero(zero_value);
-    // Loop over K chunks
-    for (int kc = 0; kc < K_chunks; ++kc) {
-        const int k_base = kc * WMMA_K;
-
-        // Cooperative load into shared memory (A_sh and B_sh_col). Each warp thread loads multiple elements.
-        // TODO (guoqingbao): optimize with vectorized load
-        const int total_elems = (int)A_sh_elems + (int)B_sh_elems; // 512
-        for (int idx = laneId; idx < total_elems; idx += 32) {
-            if (idx < (int)A_sh_elems) {
-                // A_sh: row-major [m_local * WMMA_K + k_local]
-                int m_local = idx / WMMA_K;
-                int k_local = idx % WMMA_K;
-                int global_row = row_start_in_segment + m_local;
-                T v = zero_value;
-                if (global_row < num_rows) {
-                    int token_index = sorted_token_ids[segment_start + global_row]; // original token index
-                    int k_idx = k_base + k_local;
-                    if (k_idx < size_k && token_index < size_m) {
-                        v = input[(size_t)(token_index / (topk_weights? 1: topk)) * size_k + k_idx];
-                    }
-                }
-                A_sh[m_local * WMMA_K + k_local] = v;
-            } else {
-                int idxB = idx - (int)A_sh_elems;
-                // B_sh_col arranged column-major: (k_local + n_local*WMMA_K)
-                int k_local = idxB / WMMA_N;
-                int n_local = idxB % WMMA_N;
-                int n_global = col_start + n_local;
-                T wb = zero_value;
-                if (n_global < size_n) {
-                    int k_idx = k_base + k_local;
-                    if (k_idx < size_k) {
-                        wb = expert_w[(size_t)n_global * size_k + k_idx];
-                    }
-                }
-                B_sh_col[k_local + n_local * WMMA_K] = wb;
-            }
-        }
-
-        __syncthreads();
-
-        // Load fragments from shared memory
-        fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, T, row_major> a_frag;
-        fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, T, col_major> b_frag;
-
-        // pointers & leading dims
-        const T* A_sh_ptr = A_sh;       // row-major with ld = WMMA_K
-        const T* B_sh_ptr = B_sh_col;   // col-major with ld = WMMA_K
-
-        // load fragments (warp-level)
-        load_matrix_sync(a_frag, A_sh_ptr, WMMA_K);
-        load_matrix_sync(b_frag, B_sh_ptr, WMMA_K);
-
-        // mma
-        mma_sync(c_frag, a_frag, b_frag, c_frag);
-
-        __syncthreads();
-    } // kc
-
-    // Store c_frag to shared float buffer (C_sh) using store_matrix_sync (row-major)
-    // store_matrix_sync arguments: (ptr, frag, ld, mem_row_major)
-    store_matrix_sync(C_sh, c_frag, WMMA_N, mem_row_major);
-
-    __syncthreads();
-
-    // Write only valid rows (masking) from C_sh to global output.
-    // Each lane writes multiple elements from C_sh cooperatively
-    const int total_c_elems = WMMA_M * WMMA_N; // 256
-    // TODO (guoqingbao): optimize with vectorized store
-    for (int idx = laneId; idx < total_c_elems; idx += 32) {
-        int m_local = idx / WMMA_N; // 0..15
-        int n_local = idx % WMMA_N; // 0..15
-        if (m_local >= rows_in_tile) continue; // mask out padded rows
-        int row_in_segment = row_start_in_segment + m_local;
-        int token_index = sorted_token_ids[segment_start + row_in_segment];
-        int col = col_start + n_local;
-        if (col >= size_n) continue;
-        // Write float to output[token_index, col]
-        float val = C_sh[m_local * WMMA_N + n_local];
-        if (topk_weights) val *= topk_weights[token_index];
-        vllm::from_float(output[(size_t)token_index * size_n + col], val);
-    }
-}
+constexpr int M_BLK = WARPS_M * WMMA_M; // 32
+constexpr int N_BLK = WARPS_N * WMMA_N; // 32
+constexpr int K_BLK = WMMA_K;           // 16
 
 
 // Segment description
@@ -249,80 +99,245 @@ static std::vector<ExpertSegment> make_segments_from_expert_ids_host(const int32
     return out;
 }
 
+
+/**
+ *  @brief  WMMA-based grouped MoE GEMM kernel.
+ *
+ *  @tparam T               Data type: half or nv_bfloat16
+ *
+ *  @param input            [size_m or size_m/topk, size_k]
+ *  @param weights          [num_experts, size_n, size_k] compacted expert weights
+ *  @param sorted_token_ids [size_m] mapping of per-token row indices (sorted by expert)
+ *  @param segments         [num_segments] array of {start, len, expert} describing
+ *                          contiguous token segments per expert
+ *  @param topk_weights     [size_m] optional per-token scaling weights (nullptr if unused)
+ *  @param output           [size_m, size_n] global output buffer (must be zero-initialized)
+ *  @param num_experts      Total number of experts
+ *  @param topk             Number of experts each token is routed to
+ *  @param size_m           Number of tokens
+ *  @param size_n           Output hidden dimension (per expert)
+ *  @param size_k           Input hidden dimension
+ *  @param num_segments     Number of expert segments
+*/
+template<typename T>
+__global__ void moe_gemm_grouped_atomic_kernel(
+    const T* __restrict__ input,           // [size_m, size_k]
+    const T* __restrict__ weights,         // [num_experts, size_n, size_k]
+    const int32_t* __restrict__ sorted_token_ids, // [size_m]
+    const ExpertSegment* __restrict__ segments,   // [num_segments] (Device)
+    const float* __restrict__ topk_weights, // [size_m]
+    T* __restrict__ output,                 // [size_m, size_n] (Zero-initialized)
+    const int num_experts, const int topk,
+    const int32_t size_m,
+    const int32_t size_n,
+    const int32_t size_k,
+    const int32_t num_segments
+) {
+    // Get Segment and N-Tile for this Block
+    const int seg_idx = blockIdx.x;
+    const int n_tile_idx = blockIdx.y;
+    
+    if (seg_idx >= num_segments) return;
+
+    const ExpertSegment seg = segments[seg_idx];
+    const int num_rows_in_segment = seg.len;
+    if (num_rows_in_segment == 0) return;
+
+    const int segment_start = seg.start;
+    const int expert_id = seg.expert;
+    if (expert_id < 0 || expert_id >= num_experts) return;
+
+    const int n_base = n_tile_idx * N_BLK;
+    if (n_base >= size_n) return;
+
+    const T* expert_w = weights + (size_t)expert_id * (size_t)size_n * (size_t)size_k;
+
+    extern __shared__ uint8_t smem_bytes[];
+    
+    // A tile: [M_BLK, K_BLK] (row-major)
+    T* A_sh = reinterpret_cast<T*>(smem_bytes);
+    // B tile: [N_BLK, K_BLK] (row-major)
+    T* B_sh = reinterpret_cast<T*>(A_sh + M_BLK * K_BLK);
+    uint8_t* C_ptr = reinterpret_cast<uint8_t*>(B_sh + N_BLK * K_BLK);
+
+    // align next pointer to float alignment
+    size_t offset = reinterpret_cast<uintptr_t>(C_ptr) % alignof(float);
+    if (offset != 0) {
+        C_ptr += (alignof(float) - offset);
+    }
+    float* C_sh = reinterpret_cast<float*>(C_ptr); // shared scratch for final per-block tile writes
+
+    const int threadId = threadIdx.x;
+    const int warpId = threadId / 32;
+    const int laneId = threadId % 32;
+    const int warp_m_idx = warpId / WARPS_N;
+    const int warp_n_idx = warpId % WARPS_N;
+
+    const int B_ELEMS_PER_BLOCK = N_BLK * K_BLK;
+    const int VEC_ELEMS_B = B_ELEMS_PER_BLOCK / VEC_SIZE; // 512 / 8 = 64
+    const int A_ELEMS_PER_BLOCK = M_BLK * K_BLK;
+    const int VEC_ELEMS_A = A_ELEMS_PER_BLOCK / VEC_SIZE; // 512 / 8 = 64
+    VecT zero_vec;
+    zero_vec.x = zero_vec.y = zero_vec.z = zero_vec.w = 0.0f;
+    
+    for (int m_base = 0; m_base < num_rows_in_segment; m_base += M_BLK) {
+        // We'll accumulate full-K results in per-warp fragments (initialized here)
+        fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+        fill_fragment(c_frag, 0.0f);
+
+        // For every k_block we will load B_sh and A_sh for this m_base subsequently
+        for (int k_base = 0; k_base < size_k; k_base += K_BLK) {
+            // Load B Tile (Weights) into B_sh
+            for (int i = threadId; i < VEC_ELEMS_B; i += BLOCK_THREADS) {
+                int idx = i * VEC_SIZE; // element index (0..511)
+                int n_local = idx / K_BLK;
+                int k_local = idx % K_BLK;
+
+                int n_global = n_base + n_local;
+                int k_global = k_base + k_local;
+
+                // this should be always satisfied since k dim aligned to 8
+                if (n_global < size_n && k_global < size_k) {
+                    *reinterpret_cast<VecT*>(&B_sh[n_local * K_BLK + k_local]) = *reinterpret_cast<const VecT*>(
+                        &expert_w[(size_t)n_global * size_k + k_global]
+                    );
+                } else {
+                    *reinterpret_cast<VecT*>(&B_sh[n_local * K_BLK + k_local]) = zero_vec;
+                }
+            }
+
+            // Load A Tile (Inputs) into A_sh for this m_base and this k_base
+            for (int i = threadId; i < VEC_ELEMS_A; i += BLOCK_THREADS) {
+                int idx = i * VEC_SIZE; // element index
+                int m_local = idx / K_BLK;
+                int k_local = idx % K_BLK;
+
+                int m_seg = m_base + m_local; // row index within segment
+                int k_global = k_base + k_local;
+
+                if (m_seg < num_rows_in_segment && k_global < size_k) {
+                    int token_pair_index = segment_start + m_seg; 
+                    int token_index = sorted_token_ids[token_pair_index];
+                    int input_index = token_index / (topk_weights? 1: topk);
+                    *reinterpret_cast<VecT*>(&A_sh[m_local * K_BLK + k_local]) = *reinterpret_cast<const VecT*>(
+                        &input[(size_t)input_index * size_k + k_global]
+                    );
+                } else {
+                    // in case m dim in this segment not aligned to 8
+                    *reinterpret_cast<VecT*>(&A_sh[m_local * K_BLK + k_local]) = zero_vec;
+                }
+            }
+
+            __syncthreads();
+
+            // Compute (Warp-level) : update c_frag for this k_block
+            fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, T, row_major> a_frag;
+            fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, T, col_major> b_frag;
+
+            // Point this warp to its tile in shared memory
+            const T* A_sh_ptr = A_sh + (warp_m_idx * WMMA_M * K_BLK);
+            const T* B_sh_ptr = B_sh + (warp_n_idx * WMMA_N * K_BLK);
+
+            load_matrix_sync(a_frag, A_sh_ptr, K_BLK);
+            load_matrix_sync(b_frag, B_sh_ptr, K_BLK);
+
+            // Accumulate into c_frag (which persists across k_base iterations)
+            mma_sync(c_frag, a_frag, b_frag, c_frag);
+        } // end k_base loop (we have a fully-accumulated c_frag for this m_base tile)
+
+        // Store the accumulated c_frag to C_sh (shared) once per warp
+        // Point this warp to its 16x16 tile *within* the 32x32 C_sh
+        float* C_sh_ptr = C_sh + (warp_m_idx * WMMA_M * N_BLK) + (warp_n_idx * WMMA_N);
+        // store the full accumulated 16x16 tile (note ld = N_BLK, result in row-major in C_sh)
+        store_matrix_sync(C_sh_ptr, c_frag, N_BLK, mem_row_major);
+
+        __syncthreads();
+
+        // Cooperative Store from C_sh to Global
+        // 128 threads write [M_BLK, N_BLK] = [32, 32] = 1024 elements
+        const int C_ELEMS_PER_BLOCK = M_BLK * N_BLK;
+        for (int i = threadId; i < C_ELEMS_PER_BLOCK; i += BLOCK_THREADS) {
+            int m_local_c = i / N_BLK; // row in C_sh (0..31)
+            int n_local_c = i % N_BLK; // col in C_sh (0..31)
+
+            int m_seg = m_base + m_local_c;    // row index within segment
+            int n_global = n_base + n_local_c; // col index in output
+
+            if (m_seg < num_rows_in_segment && n_global < size_n) {
+                int token_pair_index = segment_start + m_seg;
+                if (token_pair_index < size_m) {
+                    int token_index = sorted_token_ids[token_pair_index];
+                    float val = C_sh[m_local_c * N_BLK + n_local_c]; 
+                    if (topk_weights) {
+                        val *= topk_weights[token_index];
+                    }
+                    vllm::from_float(output[(size_t)token_index * size_n + n_global], val);
+                }
+            }
+        }
+    } // end m_base loop
+}
+
 extern "C" void moe_gemm_wmma(
-    const void* input,                 // [size_m, size_k]
-    const void* weights,               // [num_experts, size_n, size_k]
-    const int32_t* sorted_token_ids,   // [size_m]
-    const int32_t* expert_ids_host,      // host array [size_m] (expert id per sorted token)
-    const float* topk_weights,
+    const void* input,                // [size_m, size_k]
+    const void* weights,              // [num_experts, size_n, size_k]
+    const int32_t* sorted_token_ids,  // [size_m] (Device)
+    const int32_t* expert_ids_host,   // [size_m] (Host)
+    const float* topk_weights,        // [size_m] (Device, can be nullptr)
     void* output,                     // [size_m, size_n]
     int num_experts,
     int topk,
     int size_m,
     int size_n,
     int size_k,
-    int data_type,
+    int data_type,                    // 0 = half, 1 = bfloat16
     cudaStream_t stream
 ) {
-    // Build segments
-    std::vector<ExpertSegment> segments = make_segments_from_expert_ids_host(expert_ids_host, size_m);
+    std::vector<ExpertSegment> segments_host = make_segments_from_expert_ids_host(expert_ids_host, size_m);
+    int num_segments = segments_host.size();
+    if (num_segments == 0) return;
 
-    // Shared memory bytes: A_sh + B_sh_col (halves) + C_sh floats (ensure float alignment)
-    const size_t A_sh_elems = WMMA_M * WMMA_K;
-    const size_t B_sh_elems = WMMA_K * WMMA_N;
-    const size_t C_sh_elems = WMMA_M * WMMA_N;
+    ExpertSegment* segments_device = nullptr;
+    size_t segments_bytes = sizeof(ExpertSegment) * num_segments;
+    cudaMallocAsync(&segments_device, segments_bytes, stream);
+    cudaMemcpyAsync(segments_device, segments_host.data(), segments_bytes, 
+                    cudaMemcpyHostToDevice, stream);
 
-    // Compute shared size that the kernel expects:
-    // bytes = (A_sh_elems + B_sh_elems)*half_bytes + padding + C_sh_elems*float_bytes
-    size_t smem_bytes_min = (A_sh_elems + B_sh_elems) * 2;
-    // ensure alignment for float buffer
-    size_t pad = (alignof(float) - (smem_bytes_min % alignof(float))) % alignof(float);
-    size_t smem_bytes = smem_bytes_min + pad + C_sh_elems * 4;
+    int grid_n = CEILDIV(size_n, N_BLK);
+    dim3 grid(num_segments, grid_n, 1);
+    dim3 block(BLOCK_THREADS, 1, 1);
 
-    // Launch per-segment
-    for (const auto &seg : segments) {
-        if (seg.len <= 0) continue;
-        int seg_start = seg.start;
-        int seg_len = seg.len;
-        int expert = seg.expert;
-        assert(expert >= 0 && expert < num_experts);
+    // Shared memory: A_sh[M_BLK, K_BLK] + B_sh[N_BLK, K_BLK]
+    size_t A_sh_bytes = M_BLK * K_BLK * 2; // (32*16 * 2) = 1024
+    size_t B_sh_bytes = N_BLK * K_BLK * 2; // (32*16 * 2) = 1024
+    size_t C_sh_bytes = M_BLK * N_BLK * sizeof(float);
+    size_t AB_bytes = A_sh_bytes + B_sh_bytes;
+    size_t pad = (16 - (AB_bytes % 16)) % 16; 
+    size_t smem_bytes = AB_bytes + pad + C_sh_bytes; // ~6KB total needed
 
-        int grid_x = CEILDIV(seg_len, WMMA_M); // M tiles inside segment
-        int grid_y = CEILDIV(size_n, WMMA_N);  // N tiles
-        dim3 grid(grid_x, grid_y, 1);
-        dim3 block(32, 1, 1); // one warp per block
-
-        if (data_type == 0) {
-            moe_gemm_wmma_kernel<<<grid, block, smem_bytes, stream>>>(
-                reinterpret_cast<const half*>(input),
-                reinterpret_cast<const half*>(weights),
-                sorted_token_ids,
-                topk_weights,
-                seg_start,
-                seg_len,
-                expert,
-                topk,
-                reinterpret_cast<half*>(output),
-                size_m,
-                size_n,
-                size_k
-            );
-        } else if (data_type == 1) {
-            moe_gemm_wmma_kernel<<<grid, block, smem_bytes, stream>>>(
-                reinterpret_cast<const nv_bfloat16*>(input),
-                reinterpret_cast<const nv_bfloat16*>(weights),
-                sorted_token_ids,
-                topk_weights,
-                seg_start,
-                seg_len,
-                expert,
-                topk,
-                reinterpret_cast<nv_bfloat16*>(output),
-                size_m,
-                size_n,
-                size_k
-            );
-        }
-        
+    if (data_type == 0) { // half
+        moe_gemm_grouped_atomic_kernel<<<grid, block, smem_bytes, stream>>>(
+            reinterpret_cast<const half*>(input),
+            reinterpret_cast<const half*>(weights),
+            sorted_token_ids,
+            segments_device,
+            topk_weights,
+            reinterpret_cast<half*>(output),
+            num_experts, topk,
+            size_m, size_n, size_k, num_segments
+        );
+    } else if (data_type == 1) { // bfloat16
+        moe_gemm_grouped_atomic_kernel<<<grid, block, smem_bytes, stream>>>(
+            reinterpret_cast<const nv_bfloat16*>(input),
+            reinterpret_cast<const nv_bfloat16*>(weights),
+            sorted_token_ids,
+            segments_device,
+            topk_weights,
+            reinterpret_cast<nv_bfloat16*>(output),
+            num_experts, topk,
+            size_m, size_n, size_k, num_segments
+        );
     }
+    
+    cudaFreeAsync(segments_device, stream);
 }

@@ -42,9 +42,8 @@ pub fn moe_gemm(
         let data_type = match input.dtype() {
             DType::F16 => 0,
             DType::BF16 => 1,
-            DType::F32 => 2,
             _ => {
-                candle_core::bail!("moe_wna16_gemm only accept f16/bf16/f32 inputs!")
+                candle_core::bail!("moe_gemm only accept f16/bf16 inputs!")
             }
         };
 

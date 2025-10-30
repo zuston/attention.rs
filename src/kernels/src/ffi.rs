@@ -405,13 +405,13 @@ extern "C" {
         sorted_token_ids: *const i32,
         expert_ids: *const i32,
         topk_weights: *const f32, // device ptr or nullptr
-        output: *mut c_void,      // float output [size_m, size_n]
+        output: *mut c_void,      // output [size_m, size_n]
         num_experts: i32,
         topk: i32,
         size_m: i32,
         size_n: i32,
         size_k: i32,
-        dtype: i32, // 0=float16, 1=bf16, 2=float32 (for input)
+        dtype: i32, // 0=float16, 1=bf16 (for input)
         stream: i64,
     );
 
