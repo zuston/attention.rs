@@ -147,7 +147,9 @@ __global__ void moe_gemm_vectorized_kernel(
     // This thread's accumulator
     VecT acc;
     vllm_rs::zero(acc);
-    
+    LoadVecT zero_vec;
+    zero_vec.x = zero_vec.y = zero_vec.z = zero_vec.w = 0.0f;
+
     const int k_compute_vec_tile_size = BLOCK_K_TILE / VEC_SIZE;
     const int k_vec_tile_size = BLOCK_K_TILE / LOAD_VEC_SIZE;
     const int k_vec_dim_size = K / LOAD_VEC_SIZE;
@@ -164,6 +166,8 @@ __global__ void moe_gemm_vectorized_kernel(
             if (k_start_vec + i < k_vec_dim_size) {
                 reinterpret_cast<LoadVecT*>(s_input)[i] = 
                     reinterpret_cast<const LoadVecT*>(input_row)[k_start_vec + i];
+            } else {
+                reinterpret_cast<LoadVecT*>(s_input)[i] = zero_vec;
             }
         }
         
@@ -174,6 +178,8 @@ __global__ void moe_gemm_vectorized_kernel(
              if (k_start_vec + k_inner_vec < k_vec_dim_size) {
                 reinterpret_cast<LoadVecT*>(s_weights[tid_n])[k_inner_vec] = 
                     reinterpret_cast<const LoadVecT*>(weight_row)[k_start_vec + k_inner_vec];
+             } else {
+                reinterpret_cast<LoadVecT*>(s_weights[tid_n])[k_inner_vec] = zero_vec;
              }
         }
         
@@ -194,7 +200,7 @@ __global__ void moe_gemm_vectorized_kernel(
     if (topk_weights) {
         // Apply top-k weight scaling
         T output_val;
-        vllm::from_float(output_val, vllm::to_float(__hadd(acc.x, acc.y)) * topk_weights[token_idx]);
+        vllm::from_float(output_val, vllm::to_float(__hadd(acc.x, acc.y)) * topk_weights[token_id]);
         output[token_id * N + n] = output_val;
     } else {
         output[token_id * N + n] = __hadd(acc.x, acc.y);
