@@ -281,6 +281,16 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn copy_blocks_u8(
+        key_cache_ptrs: *mut c_void,
+        value_cache_ptrs: *mut c_void,
+        block_mapping: *const c_void,
+        num_layers: i32,
+        num_pairs: i32,
+        numel_per_block: i32,
+        stream: i64,
+    );
+
     pub fn asort_asc_f32(
         x: *const c_void,
         dst: *mut c_void,
