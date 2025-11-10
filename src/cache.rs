@@ -162,11 +162,7 @@ pub fn swap_blocks(
     }
 }
 
-#[cfg(feature = "metal")]
-pub fn swap_blocks(
-    src: &Tensor,
-    dst: &Tensor,
-    block_mapping: &HashMap<usize, usize>,
-) -> Result<()> {
-    candle_core::bail!("Unified memory does not support block swap!")
+#[cfg(not(feature = "cuda"))]
+pub fn swap_blocks(_: &Tensor, _: &Tensor, _: &HashMap<usize, usize>) -> Result<()> {
+    candle_core::bail!("Kvcache swap is not supported on this platform!")
 }
