@@ -351,25 +351,65 @@ __global__ void moe_gemm_gguf_prefill_kernel(
     } // end m_base loop
 }
 
-#define LAUNCH_MOE_GGUF_PREFILL(dtype, qk, block_q_t, wrap_size) \
-    dim3 block(wrap_size, WARPS_PER_BLOCK, 1);\
-    if (dtype == 0) { \
-        moe_gemm_gguf_prefill_kernel<half, qk, block_q_t, wrap_size><<<grid, block, smem_bytes, stream>>>(\
-            reinterpret_cast<const half*>(input),\
+#define LAUNCH_MOE_GGUF_PREFILL(DTYPE) \
+    if (gguf_type == 0) {\
+        dim3 block(32, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK8_0, block_q8_0, 32><<<grid, block, smem_bytes, stream>>>(\
+            reinterpret_cast<const DTYPE*>(input),\
             reinterpret_cast<const uint8_t*>(weights),\
             sorted_token_ids, segments_device, topk_weights,\
-            reinterpret_cast<half*>(output),\
+            reinterpret_cast<DTYPE*>(output),\
             num_experts, topk, size_m, size_n, size_k, num_segments, gguf_type\
         );\
-    } else {\
-        moe_gemm_gguf_prefill_kernel<nv_bfloat16, qk, block_q_t, wrap_size><<<grid, block, smem_bytes, stream>>>(\
-            reinterpret_cast<const nv_bfloat16*>(input),\
+    } else if (gguf_type == 1) {\
+        dim3 block(32, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK_K, block_q4_K, 32><<<grid, block, smem_bytes, stream>>>(\
+            reinterpret_cast<const DTYPE*>(input),\
             reinterpret_cast<const uint8_t*>(weights),\
             sorted_token_ids, segments_device, topk_weights,\
-            reinterpret_cast<nv_bfloat16*>(output),\
+            reinterpret_cast<DTYPE*>(output),\
             num_experts, topk, size_m, size_n, size_k, num_segments, gguf_type\
         );\
+    } else if (gguf_type == 2) {\
+        dim3 block(64, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK_K, block_q2_K, 64><<<grid, block, smem_bytes, stream>>>(\
+            reinterpret_cast<const DTYPE*>(input),\
+            reinterpret_cast<const uint8_t*>(weights),\
+            sorted_token_ids, segments_device, topk_weights,\
+            reinterpret_cast<DTYPE*>(output),\
+            num_experts, topk, size_m, size_n, size_k, num_segments, gguf_type\
+        );\
+    } else if (gguf_type == 3) {\
+        dim3 block(64, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK_K, block_q3_K, 64><<<grid, block, smem_bytes, stream>>>(\
+            reinterpret_cast<const DTYPE*>(input),\
+            reinterpret_cast<const uint8_t*>(weights),\
+            sorted_token_ids, segments_device, topk_weights,\
+            reinterpret_cast<DTYPE*>(output),\
+            num_experts, topk, size_m, size_n, size_k, num_segments, gguf_type\
+        );\
+    } else if (gguf_type == 4) { \
+        dim3 block(64, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK_K, block_q5_K, 64><<<grid, block, smem_bytes, stream>>>(\
+            reinterpret_cast<const DTYPE*>(input),\
+            reinterpret_cast<const uint8_t*>(weights),\
+            sorted_token_ids, segments_device, topk_weights,\
+            reinterpret_cast<DTYPE*>(output),\
+            num_experts, topk, size_m, size_n, size_k, num_segments, gguf_type\
+        );\
+    } else if (gguf_type == 5) { \
+        dim3 block(64, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK_K, block_q6_K, 64><<<grid, block, smem_bytes, stream>>>(\
+            reinterpret_cast<const DTYPE*>(input),\
+            reinterpret_cast<const uint8_t*>(weights),\
+            sorted_token_ids, segments_device, topk_weights,\
+            reinterpret_cast<DTYPE*>(output),\
+            num_experts, topk, size_m, size_n, size_k, num_segments, gguf_type\
+        );\
+    } else { \
+        fprintf(stderr, "moe_gemm_gguf_prefill: unsupported quantization type.\n");\
     }\
+
 
 extern "C" void moe_gemm_gguf_prefill(
     const void* input,
@@ -433,21 +473,12 @@ extern "C" void moe_gemm_gguf_prefill(
     if (C_sh_offset != 0) smem_bytes += (alignof(float) - C_sh_offset);
     smem_bytes += C_sh_bytes;
     
-    //Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5,
-    if (gguf_type == 0) {//Q8_0: 0,
-        LAUNCH_MOE_GGUF_PREFILL(dtype, QK8_0, block_q8_0, 32);
-    } else if (gguf_type == 1) { //Q4K: 1
-        LAUNCH_MOE_GGUF_PREFILL(dtype, QK_K, block_q4_K, 32);
-    } else if (gguf_type == 2) { //Q2K: 2,
-        LAUNCH_MOE_GGUF_PREFILL(dtype, QK_K, block_q2_K, 64);
-    } else if (gguf_type == 3) {// Q3K: 3,
-        LAUNCH_MOE_GGUF_PREFILL(dtype, QK_K, block_q3_K, 64);
-    } else if (gguf_type == 4) {//Q5K: 4,
-        LAUNCH_MOE_GGUF_PREFILL(dtype, QK_K, block_q5_K, 64);
-    } else if (gguf_type == 5) {//Q8_0: 4,
-        LAUNCH_MOE_GGUF_PREFILL(dtype, QK_K, block_q6_K, 64);
+    if (dtype == 0) {
+        LAUNCH_MOE_GGUF_PREFILL(half);
     } else {
-        fprintf(stderr, "moe_gemm_gguf_prefill: unsupported quantization type.\n");
+#ifndef NO_BF16_KERNEL
+        LAUNCH_MOE_GGUF_PREFILL(nv_bfloat16);
+#endif
     }
     
     cudaFreeAsync(segments_device, stream);

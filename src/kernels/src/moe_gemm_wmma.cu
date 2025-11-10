@@ -327,6 +327,7 @@ extern "C" void moe_gemm_wmma(
             size_m, size_n, size_k, num_segments
         );
     } else if (data_type == 1) { // bfloat16
+        #ifndef NO_BF16_KERNEL
         moe_gemm_grouped_atomic_kernel<<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const nv_bfloat16*>(input),
             reinterpret_cast<const nv_bfloat16*>(weights),
@@ -337,6 +338,7 @@ extern "C" void moe_gemm_wmma(
             num_experts, topk,
             size_m, size_n, size_k, num_segments
         );
+        #endif
     }
     
     cudaFreeAsync(segments_device, stream);
