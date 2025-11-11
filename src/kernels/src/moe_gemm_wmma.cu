@@ -20,9 +20,6 @@
  *   - Uses 4 warps per block (2×2 warp tiling) with block tile = 32×32×16.
  *   - Shared memory tiles are padded and zeroed for tail handling.
  *
- * @note: this wwma MoE kernel is only used for prefill not compatible with cuda graph (decoding) 
- * since we requires dynamic host ptr to build expert segments (each segment responsible for a kernel launch)
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -46,6 +43,7 @@
 #include <cstring>
 #include "attention/attention_dtypes.h"
 #include "attention/attention_utils.cuh"
+#include "moe/moe_utils.cuh"
 using namespace nvcuda::wmma;
 
 namespace vllm {
@@ -82,24 +80,6 @@ constexpr int N_BLK = WARPS_N * WMMA_N; // 32
 constexpr int K_BLK = WMMA_K;           // 16
 
 
-// Segment description
-struct ExpertSegment { int start; int len; int expert; };
-
-// Make segments from expert_ids_host (per-sorted-token expert ids)
-static std::vector<ExpertSegment> make_segments_from_expert_ids_host(const int32_t* expert_ids_host, int size_m) {
-    std::vector<ExpertSegment> out;
-    int cur = 0;
-    while (cur < size_m) {
-        int e = expert_ids_host[cur];
-        int s = cur;
-        ++cur;
-        while (cur < size_m && expert_ids_host[cur] == e) ++cur;
-        out.push_back({s, cur - s, e});
-    }
-    return out;
-}
-
-
 /**
  *  @brief  WMMA-based grouped MoE GEMM kernel.
  *
@@ -108,8 +88,7 @@ static std::vector<ExpertSegment> make_segments_from_expert_ids_host(const int32
  *  @param input            [size_m or size_m/topk, size_k]
  *  @param weights          [num_experts, size_n, size_k] compacted expert weights
  *  @param sorted_token_ids [size_m] mapping of per-token row indices (sorted by expert)
- *  @param segments         [num_segments] array of {start, len, expert} describing
- *                          contiguous token segments per expert
+ *  @param expert_offsets   [num_experts] array of {start, len} tokens indices for each expert
  *  @param topk_weights     [size_m] optional per-token scaling weights (nullptr if unused)
  *  @param output           [size_m, size_n] global output buffer (must be zero-initialized)
  *  @param num_experts      Total number of experts
@@ -117,35 +96,29 @@ static std::vector<ExpertSegment> make_segments_from_expert_ids_host(const int32
  *  @param size_m           Number of tokens
  *  @param size_n           Output hidden dimension (per expert)
  *  @param size_k           Input hidden dimension
- *  @param num_segments     Number of expert segments
 */
 template<typename T>
-__global__ void moe_gemm_grouped_atomic_kernel(
+__global__ void moe_gemm_grouped_kernel(
     const T* __restrict__ input,           // [size_m, size_k]
     const T* __restrict__ weights,         // [num_experts, size_n, size_k]
     const int32_t* __restrict__ sorted_token_ids, // [size_m]
-    const ExpertSegment* __restrict__ segments,   // [num_segments] (Device)
+    const int32_t* __restrict__ expert_offsets,   // [num_experts]
     const float* __restrict__ topk_weights, // [size_m]
     T* __restrict__ output,                 // [size_m, size_n] (Zero-initialized)
     const int num_experts, const int topk,
     const int32_t size_m,
     const int32_t size_n,
-    const int32_t size_k,
-    const int32_t num_segments
+    const int32_t size_k
 ) {
     // Get Segment and N-Tile for this Block
-    const int seg_idx = blockIdx.x;
+    const int expert_id = blockIdx.x;
     const int n_tile_idx = blockIdx.y;
-    
-    if (seg_idx >= num_segments) return;
-
-    const ExpertSegment seg = segments[seg_idx];
-    const int num_rows_in_segment = seg.len;
-    if (num_rows_in_segment == 0) return;
-
-    const int segment_start = seg.start;
-    const int expert_id = seg.expert;
     if (expert_id < 0 || expert_id >= num_experts) return;
+    const int segment_start = expert_offsets[expert_id];
+    const int segment_end = expert_offsets[expert_id + 1];
+    const int num_rows_in_segment = segment_end - segment_start;
+
+    if (num_rows_in_segment == 0) return;
 
     const int n_base = n_tile_idx * N_BLK;
     if (n_base >= size_n) return;
@@ -282,7 +255,7 @@ extern "C" void moe_gemm_wmma(
     const void* input,                // [size_m, size_k]
     const void* weights,              // [num_experts, size_n, size_k]
     const int32_t* sorted_token_ids,  // [size_m] (Device)
-    const int32_t* expert_ids_host,   // [size_m] (Host)
+    const int32_t* expert_ids,   // [size_m * topk]
     const float* topk_weights,        // [size_m] (Device, can be nullptr)
     void* output,                     // [size_m, size_n]
     int num_experts,
@@ -293,18 +266,12 @@ extern "C" void moe_gemm_wmma(
     int data_type,                    // 0 = half, 1 = bfloat16
     cudaStream_t stream
 ) {
-    std::vector<ExpertSegment> segments_host = make_segments_from_expert_ids_host(expert_ids_host, size_m);
-    int num_segments = segments_host.size();
-    if (num_segments == 0) return;
-
-    ExpertSegment* segments_device = nullptr;
-    size_t segments_bytes = sizeof(ExpertSegment) * num_segments;
-    cudaMallocAsync(&segments_device, segments_bytes, stream);
-    cudaMemcpyAsync(segments_device, segments_host.data(), segments_bytes, 
-                    cudaMemcpyHostToDevice, stream);
+    int32_t* expert_offsets;
+    cudaMallocAsync(&expert_offsets, (num_experts + 1) * sizeof(int32_t), stream);
+    calculate_expert_offsets(expert_ids, size_m, expert_offsets, num_experts, stream);
 
     int grid_n = CEILDIV(size_n, N_BLK);
-    dim3 grid(num_segments, grid_n, 1);
+    dim3 grid(num_experts, grid_n, 1);
     dim3 block(BLOCK_THREADS, 1, 1);
 
     // Shared memory: A_sh[M_BLK, K_BLK] + B_sh[N_BLK, K_BLK]
@@ -316,30 +283,30 @@ extern "C" void moe_gemm_wmma(
     size_t smem_bytes = AB_bytes + pad + C_sh_bytes; // ~6KB total needed
 
     if (data_type == 0) { // half
-        moe_gemm_grouped_atomic_kernel<<<grid, block, smem_bytes, stream>>>(
+        moe_gemm_grouped_kernel<<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const half*>(input),
             reinterpret_cast<const half*>(weights),
             sorted_token_ids,
-            segments_device,
+            expert_offsets,
             topk_weights,
             reinterpret_cast<half*>(output),
             num_experts, topk,
-            size_m, size_n, size_k, num_segments
+            size_m, size_n, size_k
         );
     } else if (data_type == 1) { // bfloat16
         #ifndef NO_BF16_KERNEL
-        moe_gemm_grouped_atomic_kernel<<<grid, block, smem_bytes, stream>>>(
+        moe_gemm_grouped_kernel<<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const nv_bfloat16*>(input),
             reinterpret_cast<const nv_bfloat16*>(weights),
             sorted_token_ids,
-            segments_device,
+            expert_offsets,
             topk_weights,
             reinterpret_cast<nv_bfloat16*>(output),
             num_experts, topk,
-            size_m, size_n, size_k, num_segments
+            size_m, size_n, size_k
         );
         #endif
     }
     
-    cudaFreeAsync(segments_device, stream);
+    cudaFreeAsync(expert_offsets, stream);
 }
