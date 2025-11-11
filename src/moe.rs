@@ -299,6 +299,7 @@ pub fn moe_gemm_gguf(
     experts_ids: &Tensor,
     topk: usize,
     is_prefill: bool,
+    dtype: candle_core::DType,
 ) -> Result<Tensor> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core as candle;
@@ -307,9 +308,7 @@ pub fn moe_gemm_gguf(
     use candle_core::DType;
     use half::{bf16, f16};
 
-    fn cuda_fwd<
-        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
-    >(
+    fn cuda_fwd(
         input: &Tensor,
         weights: &QTensor,
         topk_weights: &Option<Tensor>,
@@ -317,6 +316,7 @@ pub fn moe_gemm_gguf(
         experts_ids: &Tensor,
         topk: usize,
         is_prefill: bool,
+        dtype: DType,
     ) -> Result<Tensor> {
         let (mut size_m, size_k) = input.dims2()?;
         if topk_weights.is_none() {
@@ -326,17 +326,10 @@ pub fn moe_gemm_gguf(
         assert!(
             size_k == size_k1,
             "input {:?} and weight {:?} last dim mismatch!",
+            size_k,
             size_k1,
-            size_k
         );
         let dev = input.device().as_cuda_device()?;
-        let dtype = match input.dtype() {
-            DType::F16 => 0,
-            DType::BF16 => 1,
-            _ => {
-                candle_core::bail!("moe_gemm_gguf only accept f16 or bf16 inputs!")
-            }
-        };
 
         // Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5
         let gguf_dtype = match weights.dtype() {
@@ -351,12 +344,6 @@ pub fn moe_gemm_gguf(
                     "moe_gemm_gguf `ISQ` only accept q2k, q3k, q4k, q5k, q6k or q8_0 weights!"
                 )
             }
-        };
-
-        let (input, _) = input.storage_and_layout();
-        let input = match &*input {
-            candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
-            _ => candle::bail!("input must be a cuda tensor"),
         };
 
         let weight_ptr = weights.device_ptr()?;
@@ -378,17 +365,29 @@ pub fn moe_gemm_gguf(
             _ => candle::bail!("sorted_token_ids must be a cuda tensor"),
         };
 
-        let output = unsafe { dev.alloc::<T>(size_m * size_n) }.w()?;
+        let output = unsafe { dev.alloc::<f32>(size_m * size_n) }.w()?;
         let stream = *dev.cu_stream() as i64;
         use core::ffi::c_void;
 
         assert!(size_k % 8 == 0, "size_k must divisible by 8");
         unsafe {
             if is_prefill {
+                let input = input.to_dtype(dtype)?;
+                let (input, _) = input.storage_and_layout();
+                let (input_ptr, input_dtype) = match &*input {
+                    candle::Storage::Cuda(c) => {
+                        if dtype == DType::F16 {
+                            (*c.as_cuda_slice::<f16>()?.device_ptr() as *const c_void, 0)
+                        } else {
+                            (*c.as_cuda_slice::<bf16>()?.device_ptr() as *const c_void, 1)
+                        }
+                    }
+                    _ => candle::bail!("input must be a cuda tensor"),
+                };
                 let experts_ids_host = experts_ids.to_vec1::<u32>()?;
                 ffi::moe_gemm_gguf_prefill(
-                    *input.device_ptr() as *const c_void, // [size_m or size_m/topk, size_k]
-                    weight_ptr as *const u8,              // [num_experts, size_n, size_k]
+                    input_ptr,               // [size_m or size_m/topk, size_k]
+                    weight_ptr as *const u8, // [num_experts, size_n, size_k]
                     *sorted_token_ids.device_ptr() as *const i32,
                     experts_ids_host.as_ptr() as *const i32,
                     topk_weights_ptr,
@@ -398,19 +397,24 @@ pub fn moe_gemm_gguf(
                     size_m as i32,
                     size_n as i32,
                     size_k as i32,
-                    dtype as i32,      // 0=f16, 1=bf16 (for inputs)
+                    input_dtype as i32,
                     gguf_dtype as i32, // Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5 (for weight)
                     stream as i64,
                 );
             } else {
+                let (input, _) = input.storage_and_layout();
+                let input = match &*input {
+                    candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+                    _ => candle::bail!("input must be a cuda tensor"),
+                };
                 let (experts_ids, _) = experts_ids.storage_and_layout();
                 let experts_ids = match &*experts_ids {
                     candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
                     _ => candle::bail!("experts_ids must be a cuda tensor"),
                 };
                 ffi::moe_gemm_gguf(
-                    *input.device_ptr() as *const c_void, // [size_m or size_m/topk, size_k]
-                    weight_ptr as *const c_void,          // [num_experts, size_n, size_k]
+                    *input.device_ptr() as *const f32, // [size_m or size_m/topk, size_k]
+                    weight_ptr as *const c_void,       // [num_experts, size_n, size_k]
                     *sorted_token_ids.device_ptr() as *const i32,
                     *experts_ids.device_ptr() as *const i32,
                     topk_weights_ptr,
@@ -420,7 +424,6 @@ pub fn moe_gemm_gguf(
                     size_m as i32,
                     size_n as i32,
                     size_k as i32,
-                    dtype as i32,      // 0=f16, 1=bf16 (for inputs)
                     gguf_dtype as i32, // Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5 (for weight)
                     stream as i64,
                 );
@@ -434,7 +437,7 @@ pub fn moe_gemm_gguf(
     }
 
     match input.dtype() {
-        DType::F16 => cuda_fwd::<f16>(
+        DType::F32 => cuda_fwd(
             input,
             weights,
             topk_weights,
@@ -442,15 +445,7 @@ pub fn moe_gemm_gguf(
             experts_ids,
             topk,
             is_prefill,
-        ),
-        DType::BF16 => cuda_fwd::<bf16>(
-            input,
-            weights,
-            topk_weights,
-            sorted_token_ids,
-            experts_ids,
-            topk,
-            is_prefill,
+            dtype,
         ),
         _ => {
             candle_core::bail!("moe_gemm_gguf only accept f16/bf16 inputs!")
@@ -467,6 +462,7 @@ pub fn moe_gemm_gguf(
     _: &Tensor,
     _: usize,
     _: bool,
+    _: candle_core::DType,
 ) -> Result<Tensor> {
     candle_core::bail!("moe_gemm_gguf is not implemented on this platform!")
 }

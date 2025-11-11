@@ -177,7 +177,7 @@ __global__ void moe_gemm_gguf_prefill_kernel(
     const int32_t* __restrict__ sorted_token_ids,
     const ExpertSegment* __restrict__ segments,
     const float* __restrict__ topk_weights,
-    T* __restrict__ output,
+    float* __restrict__ output,
     const int num_experts, const int topk,
     const int32_t size_m,
     const int32_t size_n,
@@ -344,7 +344,7 @@ __global__ void moe_gemm_gguf_prefill_kernel(
                     if (topk_weights) {
                         val *= topk_weights[token_index];
                     }
-                    vllm::from_float(output[(size_t)token_index * size_n + n_global], val);
+                    output[(size_t)token_index * size_n + n_global] = val;
                 }
             }
         }
@@ -358,7 +358,7 @@ __global__ void moe_gemm_gguf_prefill_kernel(
             reinterpret_cast<const DTYPE*>(input),\
             reinterpret_cast<const uint8_t*>(weights),\
             sorted_token_ids, segments_device, topk_weights,\
-            reinterpret_cast<DTYPE*>(output),\
+            output,\
             num_experts, topk, size_m, size_n, size_k, num_segments, gguf_type\
         );\
     } else if (gguf_type == 1) {\
@@ -367,7 +367,7 @@ __global__ void moe_gemm_gguf_prefill_kernel(
             reinterpret_cast<const DTYPE*>(input),\
             reinterpret_cast<const uint8_t*>(weights),\
             sorted_token_ids, segments_device, topk_weights,\
-            reinterpret_cast<DTYPE*>(output),\
+            output,\
             num_experts, topk, size_m, size_n, size_k, num_segments, gguf_type\
         );\
     } else if (gguf_type == 2) {\
@@ -376,7 +376,7 @@ __global__ void moe_gemm_gguf_prefill_kernel(
             reinterpret_cast<const DTYPE*>(input),\
             reinterpret_cast<const uint8_t*>(weights),\
             sorted_token_ids, segments_device, topk_weights,\
-            reinterpret_cast<DTYPE*>(output),\
+            output,\
             num_experts, topk, size_m, size_n, size_k, num_segments, gguf_type\
         );\
     } else if (gguf_type == 3) {\
@@ -385,7 +385,7 @@ __global__ void moe_gemm_gguf_prefill_kernel(
             reinterpret_cast<const DTYPE*>(input),\
             reinterpret_cast<const uint8_t*>(weights),\
             sorted_token_ids, segments_device, topk_weights,\
-            reinterpret_cast<DTYPE*>(output),\
+            output,\
             num_experts, topk, size_m, size_n, size_k, num_segments, gguf_type\
         );\
     } else if (gguf_type == 4) { \
@@ -394,7 +394,7 @@ __global__ void moe_gemm_gguf_prefill_kernel(
             reinterpret_cast<const DTYPE*>(input),\
             reinterpret_cast<const uint8_t*>(weights),\
             sorted_token_ids, segments_device, topk_weights,\
-            reinterpret_cast<DTYPE*>(output),\
+            output,\
             num_experts, topk, size_m, size_n, size_k, num_segments, gguf_type\
         );\
     } else if (gguf_type == 5) { \
@@ -403,12 +403,10 @@ __global__ void moe_gemm_gguf_prefill_kernel(
             reinterpret_cast<const DTYPE*>(input),\
             reinterpret_cast<const uint8_t*>(weights),\
             sorted_token_ids, segments_device, topk_weights,\
-            reinterpret_cast<DTYPE*>(output),\
+            output,\
             num_experts, topk, size_m, size_n, size_k, num_segments, gguf_type\
         );\
-    } else { \
-        fprintf(stderr, "moe_gemm_gguf_prefill: unsupported quantization type.\n");\
-    }\
+    }
 
 
 extern "C" void moe_gemm_gguf_prefill(
@@ -417,13 +415,13 @@ extern "C" void moe_gemm_gguf_prefill(
     const int32_t* sorted_token_ids,
     const int32_t* expert_ids_host,
     const float* topk_weights,
-    void* output,
+    float* output,
     int num_experts,
     int topk,
     int size_m,
     int size_n,
     int size_k,
-    int dtype,      // 0 = half, 1 = bfloat16
+    int input_dtype,      // 0 = half, 1 = bfloat16
     int gguf_type, //Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5,
     cudaStream_t stream
 ) {
@@ -473,7 +471,7 @@ extern "C" void moe_gemm_gguf_prefill(
     if (C_sh_offset != 0) smem_bytes += (alignof(float) - C_sh_offset);
     smem_bytes += C_sh_bytes;
     
-    if (dtype == 0) {
+    if (input_dtype == 0) {
         LAUNCH_MOE_GGUF_PREFILL(half);
     } else {
 #ifndef NO_BF16_KERNEL

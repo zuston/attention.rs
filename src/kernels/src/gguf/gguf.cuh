@@ -1231,19 +1231,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
 }
 
-
-inline __device__ float to_float_(__nv_bfloat16 u) {
-  return __bfloat162float(u);
-}
-
-inline __device__ float to_float_(half h) {
-  float f;
-  asm volatile("cvt.f32.f16 %0, %1;\n" : "=f"(f) : "h"((uint16_t)h));
-  return f;
-}
-
-template<typename T>
-static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict__ vy, const int kx, const int kx_padded) {
+static __global__ void quantize_q8_1(const float * __restrict__ x, void * __restrict__ vy, const int kx, const int kx_padded) {
     const int ix = blockDim.x*blockIdx.x + threadIdx.x;
     if (ix >= kx_padded) {
         return;
@@ -1255,7 +1243,7 @@ static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict
     const int ib = i_padded / QK8_1; // block index
     const int iqs = i_padded % QK8_1; // quant index
 
-    const float xi = ix < kx ? to_float_(x[iy*kx + ix]) : 0.0f;
+    const float xi = ix < kx ? x[iy*kx + ix] : 0.0f;
     float amax = fabsf(xi);
     float sum = xi;
 
