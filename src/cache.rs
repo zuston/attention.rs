@@ -146,8 +146,77 @@ pub fn swap_blocks(
                 }
                 src_dev.synchronize()
             }
+            //PD remote kvcache transfer
+            (Device::Cuda(src_dev), Device::Cuda(dst_dev)) => {
+                let Storage::Cuda(src_storage) = &*src_storage else {
+                    candle_core::bail!("Invalid source kvcache storage!")
+                };
+                let Storage::Cuda(dst_storage) = &*dst_storage else {
+                    candle_core::bail!("Invalid dst kvcache storage!")
+                };
+                let remote_num_blocks = src.dim(0)?;
+                let local_num_blocks = dst.dim(0)?;
+
+                let src_ptr = *src_storage.as_cuda_slice::<T>()?.device_ptr();
+                let dst_ptr = *dst_storage.as_cuda_slice::<T>()?.device_ptr();
+
+                for (src_block_number, dst_block_number) in block_mapping {
+                    let src_offset: usize = src_block_number * block_size_elements;
+                    assert!(
+                        *src_block_number < remote_num_blocks,
+                        "Invalid remote block {} / {}",
+                        src_block_number,
+                        remote_num_blocks
+                    );
+                    assert!(
+                        *dst_block_number < local_num_blocks,
+                        "Invalid local block {} / {}",
+                        dst_block_number,
+                        local_num_blocks
+                    );
+
+                    assert!(
+                        src_offset + block_size_elements <= src.elem_count(),
+                        "Invalid src kvcache block {} for transfer",
+                        src_block_number
+                    );
+
+                    let src_offset: u64 = (src_block_number * block_size_elements * dtype_size)
+                        .try_into()
+                        .unwrap();
+                    let src_slice: std::mem::ManuallyDrop<CudaSlice<T>> = unsafe {
+                        let slice = src_dev.upgrade_device_ptr(
+                            src_ptr.wrapping_add(src_offset),
+                            block_size_elements * dtype_size,
+                        );
+                        std::mem::ManuallyDrop::new(slice)
+                    };
+
+                    let dst_offset: u64 = (dst_block_number * block_size_elements * dtype_size)
+                        .try_into()
+                        .unwrap();
+                    let dst_slice: std::mem::ManuallyDrop<CudaSlice<T>> = unsafe {
+                        let slice = dst_dev.upgrade_device_ptr(
+                            dst_ptr.wrapping_add(dst_offset),
+                            block_size_elements * dtype_size,
+                        );
+                        std::mem::ManuallyDrop::new(slice)
+                    };
+
+                    unsafe {
+                        result::memcpy_dtod_async(
+                            *dst_slice.device_ptr(),
+                            *src_slice.device_ptr(),
+                            block_size_elements * dtype_size,
+                            *dst_dev.cu_stream(),
+                        )
+                        .map_err(candle_core::Error::wrap)?
+                    }
+                }
+                dst_dev.synchronize()
+            }
             (src, dst) => {
-                candle_core::bail!("Tensors must be on either the GPU or CPU to swap,, got {src:?} (src) and {dst:?} (dst).")
+                candle_core::bail!("Tensors must be on either the GPU or CPU to swap, or GPU-GPU transfer, got {src:?} (src) and {dst:?} (dst).")
             }
         }
     }
