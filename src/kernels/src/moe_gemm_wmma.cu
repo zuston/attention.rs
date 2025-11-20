@@ -60,23 +60,19 @@ inline __device__ float to_float(half u) {
 
 #define CEILDIV(x,y) (((x) + (y) - 1) / (y))
 
-constexpr int WMMA_M = 16;
-constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
 using VecT = float4;
 
 // Vectorized load size (float4 = 128 bits = 8 half/bfloat16 values)
 constexpr int VEC_SIZE = 8;
-constexpr int NUM_VECS = WMMA_M * WMMA_N / 8;
+constexpr int NUM_VECS = 32;
 
 // We use 4 Warps (128 threads) per block
-constexpr int WARPS_M = 2; // 2 warps along M
-constexpr int WARPS_N = 2; // 2 warps along N
-constexpr int WARPS_PER_BLOCK = WARPS_M * WARPS_N; // 4 warps
-constexpr int BLOCK_THREADS = WARPS_PER_BLOCK * 32; // 128 threads
+constexpr int WARPS_PER_BLOCK = 4; // 4 warps
+constexpr int BLOCK_THREADS = 128; // 128 threads
 
-constexpr int M_BLK = WARPS_M * WMMA_M; // 32
-constexpr int N_BLK = WARPS_N * WMMA_N; // 32
+constexpr int M_BLK = 32;
+constexpr int N_BLK = 32;
 constexpr int K_BLK = WMMA_K;           // 16
 
 
@@ -97,7 +93,7 @@ constexpr int K_BLK = WMMA_K;           // 16
  *  @param size_n           Output hidden dimension (per expert)
  *  @param size_k           Input hidden dimension
 */
-template<typename T>
+template<typename T, int WMMA_M, int WMMA_N, int WARPS_N>
 __global__ void moe_gemm_grouped_kernel(
     const T* __restrict__ input,           // [size_m, size_k]
     const T* __restrict__ weights,         // [num_experts, size_n, size_k]
@@ -251,6 +247,18 @@ __global__ void moe_gemm_grouped_kernel(
     } // end m_base loop
 }
 
+#define LAUNCH_MOE_WMMA(DTYPE, WMMA_M, WMMA_N, WARPS_N)\
+    moe_gemm_grouped_kernel<DTYPE, WMMA_M, WMMA_N, WARPS_N><<<grid, block, smem_bytes, stream>>>(\
+        reinterpret_cast<const DTYPE*>(input),\
+        reinterpret_cast<const DTYPE*>(weights),\
+        sorted_token_ids,\
+        expert_offsets,\
+        topk_weights,\
+        reinterpret_cast<DTYPE*>(output),\
+        num_experts, topk,\
+        size_m, size_n, size_k \
+    );\
+
 extern "C" void moe_gemm_wmma(
     const void* input,                // [size_m, size_k]
     const void* weights,              // [num_experts, size_n, size_k]
@@ -258,17 +266,22 @@ extern "C" void moe_gemm_wmma(
     const int32_t* expert_ids,   // [size_m * topk]
     const float* topk_weights,        // [size_m] (Device, can be nullptr)
     void* output,                     // [size_m, size_n]
+    int32_t* expert_counts, // prealloc [num_experts]
+    int32_t* expert_offsets, // prealloc [num_experts + 1]
     int num_experts,
     int topk,
     int size_m,
     int size_n,
     int size_k,
     int data_type,                    // 0 = half, 1 = bfloat16
+    bool is_prefill,
     cudaStream_t stream
 ) {
-    int32_t* expert_offsets;
-    cudaMallocAsync(&expert_offsets, (num_experts + 1) * sizeof(int32_t), stream);
-    calculate_expert_offsets(expert_ids, size_m, expert_offsets, num_experts, stream);
+    if (is_prefill) {
+        calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
+    } else {
+        calculate_expert_offsets_light(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
+    }
 
     int grid_n = CEILDIV(size_n, N_BLK);
     dim3 grid(num_experts, grid_n, 1);
@@ -283,30 +296,19 @@ extern "C" void moe_gemm_wmma(
     size_t smem_bytes = AB_bytes + pad + C_sh_bytes; // ~6KB total needed
 
     if (data_type == 0) { // half
-        moe_gemm_grouped_kernel<<<grid, block, smem_bytes, stream>>>(
-            reinterpret_cast<const half*>(input),
-            reinterpret_cast<const half*>(weights),
-            sorted_token_ids,
-            expert_offsets,
-            topk_weights,
-            reinterpret_cast<half*>(output),
-            num_experts, topk,
-            size_m, size_n, size_k
-        );
+        if (is_prefill) {
+            LAUNCH_MOE_WMMA(half, 16, 16, 2)
+        } else {
+            // we use smaller M_tile and larger N_tile for decoding
+            LAUNCH_MOE_WMMA(half, 8, 32, 1)
+        }
     } else if (data_type == 1) { // bfloat16
         #ifndef NO_BF16_KERNEL
-        moe_gemm_grouped_kernel<<<grid, block, smem_bytes, stream>>>(
-            reinterpret_cast<const nv_bfloat16*>(input),
-            reinterpret_cast<const nv_bfloat16*>(weights),
-            sorted_token_ids,
-            expert_offsets,
-            topk_weights,
-            reinterpret_cast<nv_bfloat16*>(output),
-            num_experts, topk,
-            size_m, size_n, size_k
-        );
+        if (is_prefill) {
+            LAUNCH_MOE_WMMA(nv_bfloat16, 16, 16, 2)
+        } else {
+            LAUNCH_MOE_WMMA(nv_bfloat16, 8, 32, 1)
+        }
         #endif
     }
-    
-    cudaFreeAsync(expert_offsets, stream);
 }

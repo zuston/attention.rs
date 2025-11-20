@@ -408,7 +408,7 @@ extern "C" {
     pub fn causal_mask_f16(d_out: *mut c_void, tgt_len: i32, sliding_window: i32, stream: i64);
     pub fn causal_mask_bf16(d_out: *mut c_void, tgt_len: i32, sliding_window: i32, stream: i64);
 
-    // for unquntized models (decoding)
+    // for unquntized models (without wmma)
     pub fn moe_gemm(
         input: *const c_void,   // input [size_m, size_k]
         weights: *const c_void, // weights [num_experts, size_n, size_k]
@@ -425,20 +425,23 @@ extern "C" {
         stream: i64,
     );
 
-    // for unquntized models (prefill)
+    // for unquntized models
     pub fn moe_gemm_wmma(
         input: *const c_void,         // device pointer [size_m, size_k]
         weights: *const c_void,       // device pointer [num_experts, size_n, size_k]
         sorted_token_ids: *const i32, // device pointer [size_m]
         expert_ids: *const i32,       // host array [size_m] (expert id per sorted token)
         topk_weights: *const f32,
-        output: *mut c_void, // device pointer [size_m, size_n]
+        output: *mut c_void,      // device pointer [size_m, size_n]
+        expert_counts: *mut i32,  // pre-allocated buffer [num_experts]
+        expert_offsets: *mut i32, // pre-allocated buffer [num_experts + 1]
         num_experts: i32,
         topk: i32,
         size_m: i32,
         size_n: i32,
         size_k: i32,
         dtype: i32, // 0=float16, 1=bf16 (for input/output)
+        is_prefill: bool,
         stream: i64,
     );
 

@@ -39,14 +39,11 @@ static __global__ void count_tokens_per_expert_kernel(
 static void calculate_expert_offsets(
     const int32_t* d_expert_ids,
     int size_m,
+    int32_t* d_expert_counts,
     int32_t* d_expert_offsets,
     int num_experts,
     cudaStream_t stream
 ) {
-    // We need a temporary buffer for counts
-    int32_t* d_expert_counts;
-    cudaMallocAsync(&d_expert_counts, num_experts * sizeof(int32_t), stream);
-
     // 1. Zero-initialize the counts buffer
     cudaMemsetAsync(d_expert_counts, 0, num_experts * sizeof(int32_t), stream);
 
@@ -78,7 +75,89 @@ static void calculate_expert_offsets(
     // 4. Set the first offset (offsets[0]) to 0
     // This completes the exclusive scan.
     cudaMemsetAsync(d_expert_offsets, 0, sizeof(int32_t), stream);
+}
 
-    // 5. Clean up temporary buffer
-    cudaFreeAsync(d_expert_counts, stream);
+
+// This performs an EXCLUSIVE scan: [c0, c1] -> [0, c0, c0+c1]
+// Assumptions: num_experts <= 1024 (fits in one block)
+static __global__ void expert_prefix_sum_kernel(
+    const int32_t* __restrict__ counts,
+    int32_t* __restrict__ offsets,
+    int num_experts
+) {
+    // Use shared memory for fast scanning
+    // Size needs to be enough for num_experts
+    extern __shared__ int32_t temp_storage[];
+
+    int tid = threadIdx.x;
+
+    // We pad with 0 if tid >= num_experts
+    int val = (tid < num_experts) ? counts[tid] : 0;
+    temp_storage[tid] = val;
+    
+    __syncthreads();
+
+    // Hillis-Steele Parallel Scan (Inclusive in shared mem)
+    for (int offset = 1; offset < blockDim.x; offset <<= 1) {
+        int temp_val = 0;
+        if (tid >= offset) {
+            temp_val = temp_storage[tid - offset];
+        }
+        __syncthreads();
+        if (tid >= offset) {
+            temp_storage[tid] += temp_val;
+        }
+        __syncthreads();
+    }
+
+    // The result at temp_storage[i] is the inclusive sum of counts[0..i]
+    // We want offsets[i] = inclusive_sum[i-1]
+    // We want offsets[0] = 0
+    
+    if (tid < num_experts) {
+        // Shift right: Offset[i+1] gets the inclusive sum up to i
+        offsets[tid + 1] = temp_storage[tid];
+        
+        // Handle the first element separately
+        if (tid == 0) {
+            offsets[0] = 0;
+        }
+    }
+}
+
+static void calculate_expert_offsets_light(
+    const int32_t* d_expert_ids,
+    int size_m,
+    int32_t* d_expert_counts,
+    int32_t* d_expert_offsets,
+    int num_experts,
+    cudaStream_t stream
+) {
+    cudaMemsetAsync(d_expert_counts, 0, num_experts * sizeof(int32_t), stream);
+
+    int threads = 256;
+    int blocks = (size_m + threads - 1) / threads;
+    count_tokens_per_expert_kernel<<<blocks, threads, 0, stream>>>(
+        d_expert_ids, d_expert_counts, size_m
+    );
+
+    // We launch exactly one block with 'num_experts' threads (or next power of 2)
+    // We need shared memory size = threads * sizeof(int32_t)
+    int scan_threads = num_experts;
+    
+    // Round up scan_threads to next power of 2 if needed, 
+    // or just use a fixed size like 1024 if num_experts is small enough.
+    if (scan_threads < 32) scan_threads = 32;
+    else if (scan_threads > 1024) {
+        // Error: This custom kernel only supports up to 1024 experts
+        // Handle error or assert here
+    }
+
+    size_t smem_size = scan_threads * sizeof(int32_t);
+
+    expert_prefix_sum_kernel<<<1, scan_threads, smem_size, stream>>>(
+        d_expert_counts, 
+        d_expert_offsets, 
+        num_experts
+    );
 }

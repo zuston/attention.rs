@@ -396,9 +396,12 @@ extern "C" void moe_gemm_gguf_prefill(
     int gguf_type, //Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5,
     cudaStream_t stream
 ) {
+    int32_t* expert_counts;
+    cudaMallocAsync(&expert_counts, num_experts * sizeof(int32_t), stream);
+
     int32_t* expert_offsets;
     cudaMallocAsync(&expert_offsets, (num_experts + 1) * sizeof(int32_t), stream);
-    calculate_expert_offsets(expert_ids, size_m, expert_offsets, num_experts, stream);
+    calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
     
     int grid_n = CEILDIV(size_n, N_BLK);
     dim3 grid(num_experts, grid_n, 1);
@@ -443,6 +446,6 @@ extern "C" void moe_gemm_gguf_prefill(
         LAUNCH_MOE_GGUF_PREFILL(nv_bfloat16);
 #endif
     }
-    
+    cudaFreeAsync(expert_counts, stream);
     cudaFreeAsync(expert_offsets, stream);
 }
